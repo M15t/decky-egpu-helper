@@ -1,5 +1,5 @@
 import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, ConfirmModal, PanelSection, PanelSectionRow, ToggleField, showModal } from "@decky/ui";
+import { ButtonItem, ConfirmModal, Field, PanelSection, PanelSectionRow, ToggleField, showModal } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import { BsGpuCard } from "react-icons/bs";
 
@@ -14,7 +14,7 @@ type Status = {
 
 type BoltStatus = {
   available: boolean;
-  devices: { id: string; name: string; status: string; link: string | null; power: string | null }[];
+  devices: { id: string; name: string; status: string; link: string | null; power: string | null; generation?: string | null }[];
   error: string | null;
   gpu_on_pci?: boolean | null;
   gpu_ready?: boolean | null;
@@ -37,10 +37,11 @@ const getBacklightStatus = callable<[], BacklightStatus>("get_backlight_status")
 const setBacklightOff = callable<[boolean], BacklightStatus>("set_backlight_off");
 const restartGamescope = callable<[], { message: string }>("restart_gamescope");
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const joinMeta = (...parts: Array<string | null | undefined>) => parts.filter(Boolean).join(" · ");
 
 const boltLabels: Record<string, string> = {
   authorized: "Authorized",
-  connected: "Connected · Not authorized",
+  connected: "Connected",
   disconnected: "Disconnected",
   connecting: "Connecting",
   authorizing: "Authorizing",
@@ -66,9 +67,7 @@ function BoltSection() {
         if (!disposed) setBolt({ available: false, devices: [], error: errorText(failure), gpu_on_pci: null, gpu_ready: null });
       } finally {
         fetching = false;
-        if (!disposed) {
-          setRefreshing(false);
-        }
+        if (!disposed) setRefreshing(false);
       }
     };
     refreshNow.current = () => { void refresh(); };
@@ -79,36 +78,43 @@ function BoltSection() {
     };
   }, []);
 
+  const summary = !bolt
+    ? "Checking boltctl…"
+    : !bolt.available
+      ? (bolt.error ?? "Unknown error")
+      : !bolt.devices.length
+        ? "No devices listed by boltctl"
+        : null;
+
   return (
-    <PanelSection title="Thunderbolt / USB4">
-      <PanelSectionRow>
-        <div role="status">
-          {!bolt ? "Checking boltctl…" : !bolt.available
-            ? `Status unavailable: ${bolt.error ?? "Unknown error"}`
-            : !bolt.devices.length ? "No devices listed by boltctl" : null}
-        </div>
-      </PanelSectionRow>
+    <PanelSection title="Connection">
+      {summary && !bolt?.devices.length && (
+        <PanelSectionRow>
+          <Field
+            label={bolt && !bolt.available ? "Unavailable" : undefined}
+            description={summary}
+            padding="compact"
+            bottomSeparator="none"
+          />
+        </PanelSectionRow>
+      )}
       {bolt?.devices.map(device => (
         <PanelSectionRow key={device.id}>
-          <div>
-            <strong>{boltLabels[device.status] ?? device.status}</strong>
-            <div>{device.name}</div>
-            {device.link && <div>{device.link}</div>}
-            {device.power && <div>Power {device.power}</div>}
-          </div>
+          <Field
+            label={boltLabels[device.status] ?? device.status}
+            description={joinMeta(device.name, device.generation, device.link, device.power && `Power ${device.power}`)}
+            padding="compact"
+            bottomSeparator="none"
+          />
         </PanelSectionRow>
       ))}
       {bolt?.pci_scan?.error && (
         <PanelSectionRow>
-          <div role="alert">PCI scan: {bolt.pci_scan.error}</div>
+          <Field label="PCI scan" description={bolt.pci_scan.error} padding="compact" bottomSeparator="none" />
         </PanelSectionRow>
       )}
       <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          disabled={refreshing}
-          onClick={() => refreshNow.current()}
-        >
+        <ButtonItem layout="below" disabled={refreshing} onClick={() => refreshNow.current()}>
           {refreshing ? "Refreshing…" : "Refresh"}
         </ButtonItem>
       </PanelSectionRow>
@@ -117,20 +123,16 @@ function BoltSection() {
 }
 
 function gpuHeadline(status: Status | null, error: string) {
-  if (!status) return error ? "Status unavailable" : "Checking connection…";
+  if (!status) return error ? "Status unavailable" : "Checking…";
   if (status.devices.some(device => device.driver === "amdgpu")) return "GPU ready";
   if (status.devices.length) return "On PCI · Driver not ready";
   return "GPU not on PCI";
 }
 
-function backlightDescription(backlight: BacklightStatus | null) {
-  if (!backlight) return "Checking backlight…";
-  if (!backlight.available) return backlight.error || "No internal backlight node";
-  if (backlight.off) return undefined;
-  if (backlight.brightness != null && backlight.max != null) {
-    return `Panel at ${backlight.brightness}/${backlight.max}`;
-  }
-  return "Internal panel backlight";
+function gpuDetails(status: Status | null, error: string) {
+  if (!status) return error || undefined;
+  const names = status.devices.map(device => device.name).filter(Boolean);
+  return names.length ? names.join(" · ") : undefined;
 }
 
 function ToolsSection() {
@@ -184,9 +186,9 @@ function ToolsSection() {
       <PanelSectionRow>
         <ToggleField
           label="Force off internal backlight"
-          description={backlightDescription(backlight)}
           checked={Boolean(backlight?.off)}
           disabled={!backlight?.available}
+          bottomSeparator="none"
           onChange={(value) => { void toggle(value); }}
         />
       </PanelSectionRow>
@@ -245,14 +247,18 @@ function Content() {
       <BoltSection />
       <PanelSection title="eGPU">
         <PanelSectionRow>
-          <div role="status">
-            <strong>{gpuHeadline(status, error)}</strong>
-            {status?.devices.map(device => (
-              <div key={device.address}>{device.name || "GPU"}</div>
-            ))}
-          </div>
+          <Field
+            label={gpuHeadline(status, error)}
+            description={gpuDetails(status, error)}
+            padding="compact"
+            bottomSeparator="none"
+          />
         </PanelSectionRow>
-        {error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
+        {error && status && (
+          <PanelSectionRow>
+            <Field label="Status unavailable" description={error} padding="compact" bottomSeparator="none" />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <ButtonItem
             layout="below"
@@ -271,7 +277,11 @@ function Content() {
             {running || status?.busy ? "Restart requested…" : "Restart"}
           </ButtonItem>
         </PanelSectionRow>
-        {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
+        {message && (
+          <PanelSectionRow>
+            <Field description={message} padding="compact" bottomSeparator="none" />
+          </PanelSectionRow>
+        )}
       </PanelSection>
       <ToolsSection />
     </>
