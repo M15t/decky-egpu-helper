@@ -91,26 +91,30 @@ function BoltSection() {
       {summary && !bolt?.devices.length && (
         <PanelSectionRow>
           <Field
-            label={bolt && !bolt.available ? "Unavailable" : undefined}
-            description={summary}
-            padding="compact"
+            label={bolt && !bolt.available ? "Unavailable" : "Connection"}
+            childrenLayout="below"
             bottomSeparator="none"
-          />
+          >
+            {summary}
+          </Field>
         </PanelSectionRow>
       )}
       {bolt?.devices.map(device => (
         <PanelSectionRow key={device.id}>
           <Field
             label={boltLabels[device.status] ?? device.status}
-            description={joinMeta(device.name, device.generation, device.link, device.power && `Power ${device.power}`)}
-            padding="compact"
+            childrenLayout="below"
             bottomSeparator="none"
-          />
+          >
+            {joinMeta(device.name, device.generation, device.link, device.power && `Power ${device.power}`)}
+          </Field>
         </PanelSectionRow>
       ))}
       {bolt?.pci_scan?.error && (
         <PanelSectionRow>
-          <Field label="PCI scan" description={bolt.pci_scan.error} padding="compact" bottomSeparator="none" />
+          <Field label="PCI scan" childrenLayout="below" bottomSeparator="none">
+            {bolt.pci_scan.error}
+          </Field>
         </PanelSectionRow>
       )}
       <PanelSectionRow>
@@ -249,14 +253,17 @@ function Content() {
         <PanelSectionRow>
           <Field
             label={gpuHeadline(status, error)}
-            description={gpuDetails(status, error)}
-            padding="compact"
+            childrenLayout="below"
             bottomSeparator="none"
-          />
+          >
+            {gpuDetails(status, error)}
+          </Field>
         </PanelSectionRow>
         {error && status && (
           <PanelSectionRow>
-            <Field label="Status unavailable" description={error} padding="compact" bottomSeparator="none" />
+            <Field label="Status unavailable" childrenLayout="below" bottomSeparator="none">
+              {error}
+            </Field>
           </PanelSectionRow>
         )}
         <PanelSectionRow>
@@ -279,7 +286,7 @@ function Content() {
         </PanelSectionRow>
         {message && (
           <PanelSectionRow>
-            <Field description={message} padding="compact" bottomSeparator="none" />
+            <Field childrenLayout="below" bottomSeparator="none">{message}</Field>
           </PanelSectionRow>
         )}
       </PanelSection>
