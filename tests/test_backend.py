@@ -184,7 +184,7 @@ class BoltParsingTests(unittest.TestCase):
                        "authorizing", "auth-error", "unknown", "future-state"):
             with self.subTest(status=status):
                 self.assertEqual(main.parse_bolt_devices(BOLT_DEVICE.format(status=status)), [
-                    {"id": "device-one", "name": "Razer Core X", "status": status, "link": None, "power": None},
+                    {"id": "device-one", "name": "Razer Core X", "status": status, "generation": None, "link": None, "power": None},
                 ])
 
     def test_multiple_devices_and_color(self):
@@ -228,6 +228,7 @@ class BoltParsingTests(unittest.TestCase):
             "id": "ac178780-002e-1ce9-ffff-ffffffffffff",
             "name": "Intel TBT5 Dock",
             "status": "authorized",
+            "generation": "USB4",
             "link": "40 Gb/s",
             "power": None,
         }])
@@ -256,6 +257,7 @@ class BoltParsingTests(unittest.TestCase):
             "id": "ac178780-002e-1ce9-ffff-ffffffffffff",
             "name": "Intel TBT5 Dock",
             "status": "authorized",
+            "generation": None,
             "link": None,
             "power": None,
         }])

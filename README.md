@@ -3,14 +3,14 @@
 A standalone Decky plugin for the eGPU with PCI ID `1002:73ff`.
 
 - Show a short GPU SKU when sysfs or lspci has a name, plus PCI ready vs not on PCI.
-- Show Thunderbolt status first. Status is the main line; host, link, and power
+- Show Connection first. Status is the main line; host, generation, and link
   sit under it. GPU ready lives only in the eGPU section.
 - Manually restart `gamescope-session.target` after confirmation.
 - Optionally force the internal panel backlight off. Preference is remembered.
   Gamescope may rewrite brightness, so the plugin keeps writing `0` while the
   toggle is on. It does not auto-restore when the eGPU unplugs.
 
-Thunderbolt/USB4 status loads once when the panel opens. **Refresh** fetches it
+Connection status loads once when the panel opens. **Refresh** fetches it
 again; there is no automatic boltctl polling. If any listed device is
 `authorized`, Refresh also runs `/usr/bin/lspci -Dnn` to probe PCI config space.
 That is the same poke that makes this eGPU appear after Thunderbolt

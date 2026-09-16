@@ -364,6 +364,7 @@ def parse_bolt_devices(output):
             "name": " ".join(filter(None, (device.get("vendor"), device.get("name"))))
                     or "Thunderbolt device",
             "status": device["status"].lower(),
+            "generation": device.get("generation") or None,
             "link": link_speed(device),
             "power": device.get("power") or device.get("powering"),
         })
