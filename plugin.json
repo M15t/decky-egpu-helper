@@ -1,0 +1,11 @@
+{
+  "name": "eGPU Gamescope",
+  "author": "m15t",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility"],
+    "description": "Monitor your eGPU and manually restart Gamescope.",
+    "image": ""
+  }
+}
