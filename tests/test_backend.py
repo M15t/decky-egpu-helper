@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,7 +27,7 @@ class DetectionTests(unittest.TestCase):
                 (card / "device").mkdir()
                 (card / "device" / "label").write_text("AMD Radeon RX 6950 XT\n")
                 self.assertEqual(main.gpu_status()[0]["driver"], "amdgpu")
-                self.assertEqual(main.gpu_status()[0]["name"], "AMD Radeon RX 6950 XT")
+                self.assertEqual(main.gpu_status()[0]["name"], "RX 6950 XT")
                 (device / "device").write_text("0x9999")
                 self.assertEqual(main.gpu_status(), [])
 
@@ -39,15 +40,12 @@ class DetectionTests(unittest.TestCase):
             "Advanced Micro Devices, Inc. [AMD/ATI] Device [1002:15bf]\n"
         )
         names = main.parse_lspci_names(output)
-        self.assertEqual(
-            names["0000:05:00.0"],
-            "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]",
-        )
+        self.assertEqual(names["0000:05:00.0"], "RX 6800 XT")
         self.assertEqual(names["05:00.0"], names["0000:05:00.0"])
         self.assertNotIn("0000:63:00.0", names)
         devices = [{"address": "0000:05:00.0", "name": None, "driver": "amdgpu"}]
         main.apply_lspci_names(devices, output)
-        self.assertIn("Navi 21", devices[0]["name"])
+        self.assertEqual(devices[0]["name"], "RX 6800 XT")
         untitled = [{"address": "0000:05:00.0", "name": None}]
         main.apply_lspci_names(untitled, "00:00.0 VGA compatible controller [0300]: Other [10de:1234]")
         self.assertIsNone(untitled[0]["name"])
@@ -63,7 +61,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = main.Plugin()
         self.gpu = patch.object(main, "gpu_status", return_value=[
-            {"address": "0000:03:00.0", "driver": "amdgpu", "name": "AMD Radeon RX 6950 XT"},
+            {"address": "0000:03:00.0", "driver": "amdgpu", "name": "RX 6950 XT"},
         ])
         self.gpu_mock = self.gpu.start()
         self.unit = patch.object(main, "unit_status", new=AsyncMock(
@@ -86,7 +84,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             "output": "0000:05:00.0 VGA compatible controller [0300]: Navi 21 [Radeon RX 6800 XT] [1002:73ff]\n",
         })):
             status = await self.plugin.get_status()
-        self.assertEqual(status["devices"][0]["name"], "Navi 21 [Radeon RX 6800 XT]")
+        self.assertEqual(status["devices"][0]["name"], "RX 6800 XT")
 
     async def test_queue_and_cooldown(self):
         self.assertTrue((await self.plugin.get_status())["can_restart"])
@@ -396,3 +394,87 @@ class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["ran"])
             self.assertIn("timed out", result["error"])
             process.kill.assert_called_once()
+
+
+def make_backlight(root, name, brightness, maximum, vendor="0x1002", product="0x15bf"):
+    node = Path(root) / "class" / name
+    device = Path(root) / "pci" / name
+    device.mkdir(parents=True)
+    node.mkdir(parents=True)
+    (device / "vendor").write_text(f"{vendor}\n")
+    (device / "device").write_text(f"{product}\n")
+    (node / "device").symlink_to(device)
+    (node / "brightness").write_text(f"{brightness}\n")
+    (node / "actual_brightness").write_text(f"{brightness}\n")
+    (node / "max_brightness").write_text(f"{maximum}\n")
+    return node
+
+
+class ShortNameTests(unittest.TestCase):
+    def test_sku_from_family_string(self):
+        self.assertEqual(
+            main.short_gpu_name(
+                "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]"
+            ),
+            "RX 6800 XT",
+        )
+        self.assertEqual(main.short_gpu_name("AMD Radeon RX 6950 XT"), "RX 6950 XT")
+        self.assertEqual(main.short_gpu_name("Navi 21 [Radeon RX 6800 XT]"), "RX 6800 XT")
+
+
+class BacklightTests(unittest.TestCase):
+    def test_skips_egpu_backlight(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            internal = make_backlight(root, "amdgpu_bl0", 180, 255)
+            make_backlight(root, "amdgpu_bl1", 200, 255, product="0x73ff")
+            with patch.object(main, "BACKLIGHT", root / "class"):
+                self.assertEqual(main.internal_backlight_node(), internal)
+                status = main.backlight_status({"backlight_off": False, "saved_brightness": None})
+                self.assertTrue(status["available"])
+                self.assertEqual(status["node"], "amdgpu_bl0")
+                self.assertEqual(status["brightness"], 180)
+
+    def test_missing_node(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(main, "BACKLIGHT", Path(folder) / "missing"):
+                status = main.backlight_status()
+                self.assertFalse(status["available"])
+                self.assertEqual(status["error"], "No internal backlight node")
+
+    def test_save_restore_and_persist(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            node = make_backlight(root, "amdgpu_bl0", 180, 255)
+            settings = root / "settings"
+            settings.mkdir()
+            with patch.object(main, "BACKLIGHT", root / "class"), patch.dict(
+                "os.environ", {"DECKY_PLUGIN_SETTINGS_DIR": str(settings)}
+            ):
+                off = main.apply_backlight(True)
+                self.assertTrue(off["backlight_off"])
+                self.assertEqual(off["saved_brightness"], 180)
+                self.assertEqual((node / "brightness").read_text().strip(), "0")
+                stored = json.loads((settings / "settings.json").read_text())
+                self.assertTrue(stored["backlight_off"])
+                self.assertEqual(stored["saved_brightness"], 180)
+                on = main.apply_backlight(False)
+                self.assertFalse(on["backlight_off"])
+                self.assertEqual((node / "brightness").read_text().strip(), "180")
+
+
+class BacklightPluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_error_does_not_restart(self):
+        plugin = main.Plugin()
+        plugin._settings = {"backlight_off": False, "saved_brightness": 180}
+        with patch.object(main, "apply_backlight", side_effect=PermissionError("denied")), patch.object(
+            main, "backlight_status", return_value={
+                "available": True, "off": False, "brightness": 180, "max": 255,
+                "saved": 180, "node": "amdgpu_bl0", "error": None,
+            }
+        ), patch.object(main, "systemctl", new=AsyncMock()) as command:
+            result = await plugin.set_backlight_off(True)
+            self.assertFalse(result["available"])
+            self.assertIn("denied", result["error"])
+            command.assert_not_awaited()
+
