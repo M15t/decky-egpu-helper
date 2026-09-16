@@ -63,20 +63,30 @@ async def unit_status(unit):
     return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
 
 
+FIELD = re.compile(
+    r"(?<![A-Za-z-])(type|name|vendor|uuid|status):\s+(\S.*?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def output_preview(output):
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return " | ".join(lines)[:180]
+
+
 def parse_bolt_devices(output):
     devices = []
     current = {}
     # boltctl uses tree prefixes and may emit terminal color sequences.
     # LC_ALL=C can replace box-drawing characters with "?".
+    # Plugin pipes can add garbage before the key; match the key anywhere on the line.
     output = re.sub(r"\x1b\[[0-9;]*m", "", output)
-    for line in output.splitlines():
-        field = re.match(
-            r"^[?\s│├└─●�]*?(type|name|vendor|uuid|status):\s*(.*?)\s*$",
-            line,
-        )
+    for raw in output.splitlines():
+        line = raw.replace("\r", "").strip()
+        field = FIELD.search(line)
         if not field:
             continue
-        key, value = field.groups()
+        key, value = field.group(1).lower(), field.group(2).strip()
         if key == "type" and current:
             devices.append(current)
             current = {}
@@ -84,18 +94,18 @@ def parse_bolt_devices(output):
     if current:
         devices.append(current)
     if output.strip() and not devices:
-        raise ValueError("Unrecognized boltctl output.")
+        raise ValueError(f"Unrecognized boltctl output: {output_preview(output)}")
     result = []
     for device in devices:
         if device.get("type") == "host":
             continue
         if not device.get("uuid") or not device.get("status"):
-            raise ValueError("Incomplete boltctl device status.")
+            raise ValueError(f"Incomplete boltctl device status: {output_preview(output)}")
         result.append({
             "id": device["uuid"],
             "name": " ".join(filter(None, (device.get("vendor"), device.get("name"))))
                     or "Thunderbolt device",
-            "status": device["status"],
+            "status": device["status"].lower(),
         })
     return result
 

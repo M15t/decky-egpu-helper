@@ -190,6 +190,27 @@ class BoltParsingTests(unittest.TestCase):
             "status": "authorized",
         }])
 
+    def test_garbage_prefix_and_crlf_keep_authorized_status(self):
+        output = (
+            "\ufeff\x80 Intel TBT5 Dock\r\n"
+            "xx type:          peripheral\r\n"
+            "xx name:\tTBT5 Dock\r\n"
+            "xx vendor:        Intel\r\n"
+            "xx uuid:          ac178780-002e-1ce9-ffff-ffffffffffff\r\n"
+            "xx status:        authorized\r\n"
+            "xx authorized: Wed Sep 16 05:22:13 2026\r\n"
+            "xx connected: Wed Sep 16 05:22:11 2026\r\n"
+        )
+        self.assertEqual(main.parse_bolt_devices(output), [{
+            "id": "ac178780-002e-1ce9-ffff-ffffffffffff",
+            "name": "Intel TBT5 Dock",
+            "status": "authorized",
+        }])
+
+    def test_unrecognized_error_includes_output_preview(self):
+        with self.assertRaisesRegex(ValueError, "NOPE_TOKEN"):
+            main.parse_bolt_devices("NOPE_TOKEN garbage without fields")
+
 
 class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_read_only_command_and_environment(self):
