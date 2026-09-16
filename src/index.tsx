@@ -1,5 +1,5 @@
 import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, ConfirmModal, PanelSection, PanelSectionRow, showModal } from "@decky/ui";
+import { ButtonItem, ConfirmModal, PanelSection, PanelSectionRow, ToggleField, showModal } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import { BsGpuCard } from "react-icons/bs";
 
@@ -12,7 +12,6 @@ type Status = {
   can_restart: boolean;
 };
 
-const getStatus = callable<[], Status>("get_status");
 type BoltStatus = {
   available: boolean;
   devices: { id: string; name: string; status: string; link: string | null; power: string | null }[];
@@ -21,9 +20,33 @@ type BoltStatus = {
   gpu_ready?: boolean | null;
   pci_scan?: { ran: boolean; error: string | null } | null;
 };
+
+type BacklightStatus = {
+  available: boolean;
+  off: boolean;
+  brightness: number | null;
+  max: number | null;
+  saved: number | null;
+  node: string | null;
+  error: string | null;
+};
+
+const getStatus = callable<[], Status>("get_status");
 const getBoltStatus = callable<[], BoltStatus>("get_bolt_status");
+const getBacklightStatus = callable<[], BacklightStatus>("get_backlight_status");
+const setBacklightOff = callable<[boolean], BacklightStatus>("set_backlight_off");
 const restartGamescope = callable<[], { message: string }>("restart_gamescope");
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+const boltLabels: Record<string, string> = {
+  authorized: "Authorized",
+  connected: "Connected · Not authorized",
+  disconnected: "Disconnected",
+  connecting: "Connecting",
+  authorizing: "Authorizing",
+  "auth-error": "Authorization failed",
+  unknown: "Unknown",
+};
 
 function BoltSection() {
   const [bolt, setBolt] = useState<BoltStatus | null>(null);
@@ -56,16 +79,6 @@ function BoltSection() {
     };
   }, []);
 
-  const pciNote = bolt?.gpu_ready ? "GPU ready" : bolt?.gpu_on_pci ? "On PCI · Driver not ready" : bolt?.gpu_on_pci === false ? "GPU not on PCI" : null;
-  const labels: Record<string, string> = {
-    authorized: pciNote ? `Authorized · ${pciNote}` : "Authorized",
-    connected: "Connected · Not authorized",
-    disconnected: "Disconnected",
-    connecting: "Connecting",
-    authorizing: "Authorizing",
-    "auth-error": "Authorization failed",
-    unknown: "Unknown",
-  };
   return (
     <PanelSection title="Thunderbolt / USB4">
       <PanelSectionRow>
@@ -78,8 +91,8 @@ function BoltSection() {
       {bolt?.devices.map(device => (
         <PanelSectionRow key={device.id}>
           <div>
-            <strong>{device.name}</strong>
-            <div>{labels[device.status] ?? device.status}</div>
+            <strong>{boltLabels[device.status] ?? device.status}</strong>
+            <div>{device.name}</div>
             {device.link && <div>{device.link}</div>}
             {device.power && <div>Power {device.power}</div>}
           </div>
@@ -98,6 +111,84 @@ function BoltSection() {
         >
           {refreshing ? "Refreshing…" : "Refresh"}
         </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
+function gpuHeadline(status: Status | null, error: string) {
+  if (!status) return error ? "Status unavailable" : "Checking connection…";
+  if (status.devices.some(device => device.driver === "amdgpu")) return "GPU ready";
+  if (status.devices.length) return "On PCI · Driver not ready";
+  return "GPU not on PCI";
+}
+
+function backlightDescription(backlight: BacklightStatus | null) {
+  if (!backlight) return "Checking backlight…";
+  if (!backlight.available) return backlight.error || "No internal backlight node";
+  if (backlight.off) return undefined;
+  if (backlight.brightness != null && backlight.max != null) {
+    return `Panel at ${backlight.brightness}/${backlight.max}`;
+  }
+  return "Internal panel backlight";
+}
+
+function ToolsSection() {
+  const [backlight, setBacklight] = useState<BacklightStatus | null>(null);
+  const pending = useRef(false);
+
+  const refresh = async () => {
+    try {
+      setBacklight(await getBacklightStatus());
+    } catch (failure) {
+      setBacklight({
+        available: false,
+        off: false,
+        brightness: null,
+        max: null,
+        saved: null,
+        node: null,
+        error: errorText(failure),
+      });
+    }
+  };
+
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      if (!disposed) {
+        await refresh();
+        timer = setTimeout(tick, 4000);
+      }
+    };
+    void tick();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, []);
+
+  const toggle = async (value: boolean) => {
+    if (pending.current || !backlight?.available) return;
+    pending.current = true;
+    setBacklight({ ...backlight, off: value });
+    try {
+      setBacklight(await setBacklightOff(value));
+    } catch (failure) {
+      setBacklight({ ...backlight, available: false, error: errorText(failure) });
+    } finally {
+      pending.current = false;
+    }
+  };
+
+  return (
+    <PanelSection title="Tools">
+      <PanelSectionRow>
+        <ToggleField
+          label="Force off internal backlight"
+          description={backlightDescription(backlight)}
+          checked={Boolean(backlight?.off)}
+          disabled={!backlight?.available}
+          onChange={(value) => { void toggle(value); }}
+        />
       </PanelSectionRow>
     </PanelSection>
   );
@@ -151,37 +242,38 @@ function Content() {
 
   return (
     <>
-    <PanelSection title="eGPU">
-      <PanelSectionRow>
-        <div role="status">
-          <strong>{status ? (status.devices.some(device => device.driver === "amdgpu") ? "GPU ready" : status.devices.length ? "On PCI · Driver not ready" : "GPU not on PCI") : (error ? "Status unavailable" : "Checking connection…")}</strong>
-          {status?.devices.map(device => (
-            <div key={device.address}>{device.name || "GPU"}{device.driver ? ` · ${device.driver}` : ""}</div>
-          ))}
-        </div>
-      </PanelSectionRow>
-      {error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          disabled={running || status?.busy === true}
-          onClick={() => showModal(
-            <ConfirmModal
-              strTitle="Restart Gamescope?"
-              strDescription="This may close your game and restart Steam. Save first."
-              strOKButtonText="Restart"
-              strCancelButtonText="Cancel"
-              bDestructiveWarning
-              onOK={() => { void restart(); }}
-            />,
-          )}
-        >
-          {running || status?.busy ? "Restart requested…" : "Restart"}
-        </ButtonItem>
-      </PanelSectionRow>
-      {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
-    </PanelSection>
-    <BoltSection />
+      <BoltSection />
+      <PanelSection title="eGPU">
+        <PanelSectionRow>
+          <div role="status">
+            <strong>{gpuHeadline(status, error)}</strong>
+            {status?.devices.map(device => (
+              <div key={device.address}>{device.name || "GPU"}</div>
+            ))}
+          </div>
+        </PanelSectionRow>
+        {error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={running || status?.busy === true}
+            onClick={() => showModal(
+              <ConfirmModal
+                strTitle="Restart Gamescope?"
+                strDescription="This may close your game and restart Steam. Save first."
+                strOKButtonText="Restart"
+                strCancelButtonText="Cancel"
+                bDestructiveWarning
+                onOK={() => { void restart(); }}
+              />,
+            )}
+          >
+            {running || status?.busy ? "Restart requested…" : "Restart"}
+          </ButtonItem>
+        </PanelSectionRow>
+        {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
+      </PanelSection>
+      <ToolsSection />
     </>
   );
 }

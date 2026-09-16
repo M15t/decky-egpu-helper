@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 import re
@@ -6,9 +7,13 @@ import time
 
 
 PCI_DEVICES = Path("/sys/bus/pci/devices")
+BACKLIGHT = Path("/sys/class/backlight")
 GPU_ID = ("0x1002", "0x73ff")
 SERVICE = "egpu-gamescope-fix.service"
 TARGET = "gamescope-session.target"
+SETTINGS_FILE = "settings.json"
+BACKLIGHT_POLL_SEC = 2
+RADEON_BRACKET = re.compile(r"\[([^\]]*Radeon[^\]]*)\]", re.IGNORECASE)
 
 
 def gpu_label(device):
@@ -27,14 +32,14 @@ def gpu_label(device):
                 except FileNotFoundError:
                     continue
                 if label:
-                    return label
+                    return short_gpu_name(label)
     for name in ("label", "model", "product"):
         try:
             label = (device / name).read_text().strip()
         except FileNotFoundError:
             continue
         if label:
-            return label
+            return short_gpu_name(label)
     return None
 
 
@@ -51,12 +56,35 @@ def parse_lspci_names(output):
         address, name = match.group(1), match.group(2).strip()
         if not name:
             continue
+        short = short_gpu_name(name)
         if address:
-            names[address] = name
+            names[address] = short
             if ":" in address:
-                names[address.split(":", 1)[1]] = name
-        names["1002:73ff"] = name
+                names[address.split(":", 1)[1]] = short
+        names["1002:73ff"] = short
     return names
+
+
+def short_gpu_name(name):
+    if not name:
+        return None
+    text = " ".join(name.split())
+    bracket = RADEON_BRACKET.search(text)
+    haystack = bracket.group(1) if bracket else text
+    haystack = re.sub(r"^(?:AMD(?:/ATI)?\s+)?Radeon\s+", "", haystack, flags=re.IGNORECASE)
+    parts = [part.strip() for part in haystack.split("/") if part.strip()]
+    if not parts:
+        return text
+    prefix, candidates = "RX", []
+    for part in parts:
+        match = re.match(r"(RX)\s+(.*)$", part, re.IGNORECASE)
+        if match:
+            prefix, part = match.group(1).upper(), match.group(2)
+        candidates.append(part)
+    chosen = next((part for part in candidates if re.search(r"\bXT\b", part, re.IGNORECASE)), candidates[-1])
+    if not re.match(r"RX\b", chosen, re.IGNORECASE):
+        chosen = f"{prefix} {chosen}"
+    return " ".join(chosen.split())
 
 
 def apply_lspci_names(devices, output):
@@ -92,6 +120,159 @@ def gpu_status():
             # Hot-unplug can remove a device between reads.
             continue
     return devices
+
+
+def sys_int(path):
+    try:
+        return int(Path(path).read_text().strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def pci_ids_for(path):
+    current = Path(path).resolve()
+    for parent in (current, *current.parents):
+        vendor = parent / "vendor"
+        device = parent / "device"
+        if vendor.exists() and device.exists():
+            try:
+                return (
+                    vendor.read_text().strip().lower(),
+                    device.read_text().strip().lower(),
+                )
+            except (FileNotFoundError, OSError):
+                return None
+    return None
+
+
+def is_egpu_backlight(node):
+    return pci_ids_for(node) == GPU_ID
+
+
+def internal_backlight_node():
+    if not BACKLIGHT.exists():
+        return None
+    nodes = sorted(path for path in BACKLIGHT.iterdir() if path.is_dir())
+    internal = [node for node in nodes if not is_egpu_backlight(node)]
+    preferred = [node for node in internal if node.name.startswith("amdgpu_bl")]
+    return (preferred or internal or [None])[0]
+
+
+def read_backlight(node):
+    brightness = sys_int(node / "brightness")
+    maximum = sys_int(node / "max_brightness")
+    actual = sys_int(node / "actual_brightness")
+    if brightness is None and actual is None:
+        raise FileNotFoundError(str(node / "brightness"))
+    return {
+        "node": node.name,
+        "path": str(node),
+        "brightness": actual if actual is not None else brightness,
+        "requested": brightness,
+        "max": maximum,
+    }
+
+
+def write_backlight(node, value):
+    (node / "brightness").write_text(str(int(value)))
+
+
+def default_restore(maximum):
+    if not maximum:
+        return 1
+    return max(1, int(maximum * 0.4))
+
+
+def settings_dir():
+    return Path(os.environ.get("DECKY_PLUGIN_SETTINGS_DIR") or ".")
+
+
+def settings_path():
+    return settings_dir() / SETTINGS_FILE
+
+
+def load_settings():
+    try:
+        data = json.loads(settings_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    saved = data.get("saved_brightness")
+    try:
+        saved = int(saved) if saved is not None else None
+    except (TypeError, ValueError):
+        saved = None
+    return {
+        "backlight_off": bool(data.get("backlight_off", False)),
+        "saved_brightness": saved if saved and saved > 0 else None,
+    }
+
+
+def save_settings(settings):
+    settings_dir().mkdir(parents=True, exist_ok=True)
+    settings_path().write_text(json.dumps({
+        "backlight_off": bool(settings.get("backlight_off")),
+        "saved_brightness": settings.get("saved_brightness"),
+    }))
+
+
+def backlight_status(settings=None):
+    settings = settings if settings is not None else load_settings()
+    node = internal_backlight_node()
+    if node is None:
+        return {
+            "available": False,
+            "off": bool(settings.get("backlight_off")),
+            "brightness": None,
+            "max": None,
+            "saved": settings.get("saved_brightness"),
+            "node": None,
+            "error": "No internal backlight node",
+        }
+    try:
+        current = read_backlight(node)
+    except (FileNotFoundError, OSError, ValueError) as failure:
+        return {
+            "available": False,
+            "off": bool(settings.get("backlight_off")),
+            "brightness": None,
+            "max": None,
+            "saved": settings.get("saved_brightness"),
+            "node": node.name,
+            "error": str(failure) or "Could not read backlight",
+        }
+    return {
+        "available": True,
+        "off": bool(settings.get("backlight_off")),
+        "brightness": current["brightness"],
+        "max": current["max"],
+        "saved": settings.get("saved_brightness"),
+        "node": current["node"],
+        "error": None,
+    }
+
+
+def apply_backlight(off, settings=None):
+    settings = dict(settings if settings is not None else load_settings())
+    node = internal_backlight_node()
+    if node is None:
+        raise FileNotFoundError("No internal backlight node")
+    current = read_backlight(node)
+    if off:
+        level = current["requested"]
+        if level is None:
+            level = current["brightness"]
+        if level and level > 0:
+            settings["saved_brightness"] = level
+        write_backlight(node, 0)
+        settings["backlight_off"] = True
+    else:
+        restore = settings.get("saved_brightness") or default_restore(current["max"])
+        if current["max"] is not None:
+            restore = min(restore, current["max"])
+        write_backlight(node, max(1, restore))
+        settings["backlight_off"] = False
+    save_settings(settings)
+    return settings
 
 
 async def systemctl(*args):
@@ -261,6 +442,9 @@ class Plugin:
         self._cooldown_until = 0.0
         self._lspci_names = {}
         self._lspci_at = 0.0
+        self._backlight_lock = asyncio.Lock()
+        self._backlight_task = None
+        self._settings = load_settings()
 
     async def lspci_names(self):
         if self._lspci_names and time.monotonic() - self._lspci_at < 5:
@@ -343,3 +527,59 @@ class Plugin:
             await systemctl("--no-block", "restart", TARGET)
             self._cooldown_until = time.monotonic() + 15
             return {"message": "Restart queued. Steam may disconnect while Gamescope restarts."}
+
+    async def _main(self):
+        if self._settings.get("backlight_off"):
+            try:
+                self._settings = await asyncio.to_thread(apply_backlight, True, self._settings)
+            except (FileNotFoundError, OSError, PermissionError):
+                pass
+        self._backlight_task = asyncio.create_task(self._keep_backlight_off())
+
+    async def _unload(self):
+        if self._backlight_task:
+            self._backlight_task.cancel()
+            try:
+                await self._backlight_task
+            except asyncio.CancelledError:
+                pass
+            self._backlight_task = None
+
+    async def _keep_backlight_off(self):
+        while True:
+            await asyncio.sleep(BACKLIGHT_POLL_SEC)
+            if not self._settings.get("backlight_off"):
+                continue
+            async with self._backlight_lock:
+                if not self._settings.get("backlight_off"):
+                    continue
+                try:
+                    node = internal_backlight_node()
+                    if node is None:
+                        continue
+                    current = read_backlight(node)
+                    if (current["requested"] or 0) > 0:
+                        write_backlight(node, 0)
+                except (FileNotFoundError, OSError, PermissionError, ValueError):
+                    continue
+
+    async def get_backlight_status(self):
+        return await asyncio.to_thread(backlight_status, self._settings)
+
+    async def set_backlight_off(self, enabled: bool):
+        async with self._backlight_lock:
+            try:
+                self._settings = await asyncio.to_thread(
+                    apply_backlight, bool(enabled), self._settings,
+                )
+            except PermissionError as failure:
+                status = backlight_status(self._settings)
+                status["available"] = False
+                status["error"] = str(failure) or "Permission denied writing backlight"
+                return status
+            except (FileNotFoundError, OSError, ValueError) as failure:
+                status = backlight_status(self._settings)
+                status["available"] = False
+                status["error"] = str(failure) or "Could not set backlight"
+                return status
+            return backlight_status(self._settings)

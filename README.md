@@ -2,11 +2,13 @@
 
 A standalone Decky plugin for the eGPU with PCI ID `1002:73ff`.
 
-- Show the GPU marketing name when sysfs has one, plus PCI ready vs not on PCI.
-- Show Thunderbolt authorized/connected/disconnected, link speed, and power if
-  boltctl reports them. Authorized plus GPU-not-on-PCI is a failed PCIe probe,
-  not a rendering success.
+- Show a short GPU SKU when sysfs or lspci has a name, plus PCI ready vs not on PCI.
+- Show Thunderbolt status first. Status is the main line; host, link, and power
+  sit under it. GPU ready lives only in the eGPU section.
 - Manually restart `gamescope-session.target` after confirmation.
+- Optionally force the internal panel backlight off. Preference is remembered.
+  Gamescope may rewrite brightness, so the plugin keeps writing `0` while the
+  toggle is on. It does not auto-restore when the eGPU unplugs.
 
 Thunderbolt/USB4 status loads once when the panel opens. **Refresh** fetches it
 again; there is no automatic boltctl polling. If any listed device is
@@ -36,6 +38,10 @@ Connection does not prove that Gamescope or a game is rendering on the eGPU.
 The script creates its marker before restarting, so a present marker is not
 proof of success either. A completed oneshot service normally becomes inactive.
 The PCI ID identifies a model, not whether its physical connection is external.
+
+Internal backlight uses `/sys/class/backlight`, skipping any node on the eGPU
+(`1002:73ff`). The plugin stays non-root; if brightness is not writable the
+toggle disables with the error. Unload does not turn the panel back on.
 
 ## Build and install
 
