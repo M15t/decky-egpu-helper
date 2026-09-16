@@ -166,6 +166,30 @@ class BoltParsingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 main.parse_bolt_devices(output)
 
+    def test_steamos_question_mark_tree_keeps_authorized_status(self):
+        output = """ ? Intel TBT5 Dock
+   ?? type:          peripheral
+   ?? name:          TBT5 Dock
+   ?? vendor:        Intel
+   ?? uuid:          ac178780-002e-1ce9-ffff-ffffffffffff
+   ?? generation:    USB4
+   ?? status:        authorized
+   ? ?? domain:    1a9b3804-b053-6472-ffff-ffffffffffff
+   ? ?? rx speed:  40 Gb/s = 2 lanes * 20 Gb/s
+   ? ?? tx speed:  40 Gb/s = 2 lanes * 20 Gb/s
+   ? ?? authflags: none
+   ?? authorized: Wed Sep 16 05:22:13 2026
+   ?? connected: Wed Sep 16 05:22:11 2026
+   ?? stored:        yes
+      ?? policy:     auto
+      ?? key:        no
+"""
+        self.assertEqual(main.parse_bolt_devices(output), [{
+            "id": "ac178780-002e-1ce9-ffff-ffffffffffff",
+            "name": "Intel TBT5 Dock",
+            "status": "authorized",
+        }])
+
 
 class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_read_only_command_and_environment(self):
@@ -181,7 +205,7 @@ class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["devices"][0]["status"], "connected")
             args, kwargs = spawn.call_args
             self.assertEqual(args, ("/usr/bin/boltctl", "list"))
-            self.assertEqual(kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(kwargs["env"]["LC_ALL"], "C.UTF-8")
             self.assertNotIn("LD_PRELOAD", kwargs["env"])
             self.assertNotIn("LD_LIBRARY_PATH", kwargs["env"])
 
@@ -220,3 +244,60 @@ class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
             result = await main.bolt_status()
             self.assertFalse(result["available"])
             self.assertIn("Unrecognized", result["error"])
+
+    async def test_authorized_refresh_runs_lspci(self):
+        process = AsyncMock()
+        process.returncode = 0
+        process.communicate.return_value = (b"00:00.0", b"")
+        with patch("main.asyncio.create_subprocess_exec", return_value=process) as spawn:
+            result = await main.pci_scan()
+            self.assertEqual(result, {"ran": True, "error": None})
+            args, kwargs = spawn.call_args
+            self.assertEqual(args, ("/usr/bin/lspci", "-Dnn"))
+            self.assertNotIn("LD_PRELOAD", kwargs["env"])
+
+    async def test_authorized_devices_trigger_pci_scan(self):
+        with patch.object(main, "bolt_status", new=AsyncMock(return_value={
+            "available": True,
+            "devices": [{"id": "one", "name": "Dock", "status": "authorized"}],
+            "error": None,
+        })), patch.object(main, "pci_scan", new=AsyncMock(return_value={"ran": True, "error": None})) as scan:
+            result = await main.Plugin().get_bolt_status()
+            scan.assert_awaited_once()
+            self.assertEqual(result["pci_scan"], {"ran": True, "error": None})
+
+    async def test_unauthorised_devices_do_not_scan_pci(self):
+        for status in ("connected", "disconnected", "authorizing"):
+            with patch.object(main, "bolt_status", new=AsyncMock(return_value={
+                "available": True,
+                "devices": [{"id": "one", "name": "Dock", "status": status}],
+                "error": None,
+            })), patch.object(main, "pci_scan", new=AsyncMock()) as scan:
+                result = await main.Plugin().get_bolt_status()
+                scan.assert_not_awaited()
+                self.assertIsNone(result["pci_scan"])
+
+    async def test_lspci_failure_does_not_drop_bolt_status(self):
+        with patch.object(main, "bolt_status", new=AsyncMock(return_value={
+            "available": True,
+            "devices": [{"id": "one", "name": "Dock", "status": "authorized"}],
+            "error": None,
+        })), patch.object(main, "pci_scan", new=AsyncMock(return_value={
+            "ran": False, "error": "lspci is not installed.",
+        })):
+            result = await main.Plugin().get_bolt_status()
+            self.assertTrue(result["available"])
+            self.assertEqual(result["devices"][0]["status"], "authorized")
+            self.assertEqual(result["pci_scan"]["error"], "lspci is not installed.")
+
+    async def test_lspci_timeout_kills_child(self):
+        process = AsyncMock()
+        process.returncode = None
+        from unittest.mock import Mock
+        process.kill = Mock()
+        process.communicate.side_effect = [asyncio.TimeoutError(), (b"", b"")]
+        with patch("main.asyncio.create_subprocess_exec", return_value=process):
+            result = await main.pci_scan()
+            self.assertFalse(result["ran"])
+            self.assertIn("timed out", result["error"])
+            process.kill.assert_called_once()

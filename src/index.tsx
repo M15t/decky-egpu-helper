@@ -17,6 +17,7 @@ type BoltStatus = {
   available: boolean;
   devices: { id: string; name: string; status: string }[];
   error: string | null;
+  pci_scan?: { ran: boolean; error: string | null } | null;
 };
 const getBoltStatus = callable<[], BoltStatus>("get_bolt_status");
 const restartGamescope = callable<[], { message: string }>("restart_gamescope");
@@ -29,11 +30,9 @@ function BoltSection() {
   useEffect(() => {
     let disposed = false;
     let fetching = false;
-    let timer: ReturnType<typeof setTimeout>;
     const refresh = async () => {
       if (disposed || fetching) return;
       fetching = true;
-      clearTimeout(timer);
       setRefreshing(true);
       try {
         const next = await getBoltStatus();
@@ -44,7 +43,6 @@ function BoltSection() {
         fetching = false;
         if (!disposed) {
           setRefreshing(false);
-          timer = setTimeout(refresh, 2000);
         }
       }
     };
@@ -52,7 +50,6 @@ function BoltSection() {
     void refresh();
     return () => {
       disposed = true;
-      clearTimeout(timer);
       refreshNow.current = () => {};
     };
   }, []);
@@ -83,6 +80,11 @@ function BoltSection() {
           </div>
         </PanelSectionRow>
       ))}
+      {bolt?.pci_scan?.error && (
+        <PanelSectionRow>
+          <div role="alert">PCI scan: {bolt.pci_scan.error}</div>
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <ButtonItem
           layout="below"

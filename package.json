@@ -1,6 +1,6 @@
 {
   "name": "egpu-gamescope",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Decky eGPU connection status and Gamescope restart",
   "type": "module",
   "license": "BSD-3-Clause",

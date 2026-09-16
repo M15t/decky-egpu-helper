@@ -67,9 +67,13 @@ def parse_bolt_devices(output):
     devices = []
     current = {}
     # boltctl uses tree prefixes and may emit terminal color sequences.
+    # LC_ALL=C can replace box-drawing characters with "?".
     output = re.sub(r"\x1b\[[0-9;]*m", "", output)
     for line in output.splitlines():
-        field = re.match(r"^[\s│├└─]*?(type|name|vendor|uuid|status):\s*(.*?)\s*$", line)
+        field = re.match(
+            r"^[?\s│├└─●�]*?(type|name|vendor|uuid|status):\s*(.*?)\s*$",
+            line,
+        )
         if not field:
             continue
         key, value = field.groups()
@@ -97,14 +101,10 @@ def parse_bolt_devices(output):
 
 
 async def bolt_status():
-    env = os.environ.copy()
-    env.pop("LD_LIBRARY_PATH", None)
-    env.pop("LD_PRELOAD", None)
-    env.update({"LC_ALL": "C", "TERM": "dumb", "NO_COLOR": "1"})
     try:
         process = await asyncio.create_subprocess_exec(
             "/usr/bin/boltctl", "list",
-            env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=clean_env(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
@@ -131,13 +131,53 @@ async def bolt_status():
     return {"available": False, "devices": [], "error": error}
 
 
+def clean_env():
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+    env.update({"LC_ALL": "C.UTF-8", "TERM": "dumb", "NO_COLOR": "1"})
+    return env
+
+
+async def pci_scan():
+    # Authorized Thunderbolt is not PCI enumeration. lspci reads config space
+    # and is the same poke that makes the eGPU appear on this hardware.
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/lspci", "-Dnn",
+            env=clean_env(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                process.kill()
+            await process.communicate()
+            raise
+        if process.returncode:
+            raise RuntimeError(stderr.decode(errors="replace").strip() or "lspci failed.")
+        return {"ran": True, "error": None}
+    except FileNotFoundError:
+        error = "lspci is not installed."
+    except asyncio.TimeoutError:
+        error = "lspci timed out."
+    except (OSError, RuntimeError) as failure:
+        error = str(failure)
+    return {"ran": False, "error": error}
+
+
 class Plugin:
     def __init__(self):
         self._restart_lock = asyncio.Lock()
         self._cooldown_until = 0.0
 
     async def get_bolt_status(self):
-        return await bolt_status()
+        result = await bolt_status()
+        if result["available"] and any(device["status"] == "authorized" for device in result["devices"]):
+            result["pci_scan"] = await pci_scan()
+        else:
+            result["pci_scan"] = None
+        return result
 
     async def get_status(self):
         devices = await asyncio.to_thread(gpu_status)

@@ -7,13 +7,16 @@ A standalone Decky plugin for the eGPU with PCI ID `1002:73ff`.
   (not yet authorized), and disconnected states. This includes non-eGPU devices.
 - Manually restart `gamescope-session.target` after confirmation.
 
-Thunderbolt/USB4 status is read-only and refreshes independently every two
-seconds after each response. **Refresh** fetches it immediately; overlapping
-requests are prevented. It requires `/usr/bin/boltctl` and a working boltd
-service. Missing tools, timeouts, and errors appear separately without blocking
-PCI status or restart controls. An empty list means no devices were reported,
-not proof that a specific eGPU is disconnected. Authorization is not proof of
-GPU rendering. The plugin never enrolls or authorizes devices.
+Thunderbolt/USB4 status loads once when the panel opens. **Refresh** fetches it
+again; there is no automatic boltctl polling. If any listed device is
+`authorized`, Refresh also runs `/usr/bin/lspci -Dnn` to probe PCI config space.
+That is the same poke that makes this eGPU appear after Thunderbolt
+authorization; it does not restart Gamescope and does not authorize devices.
+Overlapping requests are prevented. It requires `/usr/bin/boltctl` and a working
+boltd service. Missing tools, timeouts, and errors appear separately without
+blocking PCI status or restart controls. An empty list means no devices were
+reported, not proof that a specific eGPU is disconnected. Authorization is not
+proof of GPU rendering.
 
 The plugin runs as the Decky installation user, **without root**. It does not
 install, modify, or execute your existing script. Your automatic service can
