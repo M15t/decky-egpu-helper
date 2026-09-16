@@ -11,6 +11,33 @@ SERVICE = "egpu-gamescope-fix.service"
 TARGET = "gamescope-session.target"
 
 
+def gpu_label(device):
+    for path in (
+        device / "drm",
+        Path("/sys/class/drm"),
+    ):
+        if not path.exists():
+            continue
+        for node in path.iterdir():
+            if not node.name.startswith("card") or "-" in node.name:
+                continue
+            for name in ("device/label", "label"):
+                try:
+                    label = (node / name).read_text().strip()
+                except FileNotFoundError:
+                    continue
+                if label:
+                    return label
+    for name in ("label", "model", "product"):
+        try:
+            label = (device / name).read_text().strip()
+        except FileNotFoundError:
+            continue
+        if label:
+            return label
+    return None
+
+
 def gpu_status():
     devices = []
     # An unavailable sysfs is an error, not a disconnected GPU.
@@ -24,6 +51,7 @@ def gpu_status():
             devices.append({
                 "address": device.name,
                 "driver": driver.resolve().name if driver.exists() else None,
+                "name": gpu_label(device),
             })
         except FileNotFoundError:
             # Hot-unplug can remove a device between reads.
@@ -64,9 +92,23 @@ async def unit_status(unit):
 
 
 FIELD = re.compile(
-    r"(?<![A-Za-z-])(type|name|vendor|uuid|status):\s+(\S.*?)\s*$",
+    r"(?<![A-Za-z-])(type|name|vendor|uuid|status|rx speed|tx speed|generation|power|powering):\s+(\S.*?)\s*$",
     re.IGNORECASE,
 )
+
+
+def compact_speed(value):
+    if not value:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?\s*Gb/s)", value, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def link_speed(device):
+    rx, tx = compact_speed(device.get("rx speed")), compact_speed(device.get("tx speed"))
+    if rx and tx and rx != tx:
+        return f"{rx} RX · {tx} TX"
+    return rx or tx
 
 
 def output_preview(output):
@@ -106,6 +148,8 @@ def parse_bolt_devices(output):
             "name": " ".join(filter(None, (device.get("vendor"), device.get("name"))))
                     or "Thunderbolt device",
             "status": device["status"].lower(),
+            "link": link_speed(device),
+            "power": device.get("power") or device.get("powering"),
         })
     return result
 
@@ -183,6 +227,14 @@ class Plugin:
 
     async def get_bolt_status(self):
         result = await bolt_status()
+        try:
+            gpus = await asyncio.to_thread(gpu_status)
+            result["gpu_on_pci"] = bool(gpus)
+            result["gpu_ready"] = any(device.get("driver") == "amdgpu" for device in gpus)
+        except FileNotFoundError:
+            # Missing sysfs is not "GPU unplugged". Leave PCI unknown.
+            result["gpu_on_pci"] = None
+            result["gpu_ready"] = None
         if result["available"] and any(device["status"] == "authorized" for device in result["devices"]):
             result["pci_scan"] = await pci_scan()
         else:

@@ -17,10 +17,16 @@ class DetectionTests(unittest.TestCase):
             (device / "device").write_text("0x73ff\n")
             with patch.object(main, "PCI_DEVICES", root):
                 self.assertIsNone(main.gpu_status()[0]["driver"])
+                self.assertIsNone(main.gpu_status()[0]["name"])
                 driver = root / "amdgpu"
                 driver.mkdir()
                 (device / "driver").symlink_to(driver)
+                card = device / "drm" / "card1"
+                card.mkdir(parents=True)
+                (card / "device").mkdir()
+                (card / "device" / "label").write_text("AMD Radeon RX 6950 XT\n")
                 self.assertEqual(main.gpu_status()[0]["driver"], "amdgpu")
+                self.assertEqual(main.gpu_status()[0]["name"], "AMD Radeon RX 6950 XT")
                 (device / "device").write_text("0x9999")
                 self.assertEqual(main.gpu_status(), [])
 
@@ -35,7 +41,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = main.Plugin()
         self.gpu = patch.object(main, "gpu_status", return_value=[
-            {"address": "0000:03:00.0", "driver": "amdgpu"},
+            {"address": "0000:03:00.0", "driver": "amdgpu", "name": "AMD Radeon RX 6950 XT"},
         ])
         self.gpu_mock = self.gpu.start()
         self.unit = patch.object(main, "unit_status", new=AsyncMock(
@@ -144,7 +150,7 @@ class BoltParsingTests(unittest.TestCase):
                        "authorizing", "auth-error", "unknown", "future-state"):
             with self.subTest(status=status):
                 self.assertEqual(main.parse_bolt_devices(BOLT_DEVICE.format(status=status)), [
-                    {"id": "device-one", "name": "Razer Core X", "status": status},
+                    {"id": "device-one", "name": "Razer Core X", "status": status, "link": None, "power": None},
                 ])
 
     def test_multiple_devices_and_color(self):
@@ -188,7 +194,18 @@ class BoltParsingTests(unittest.TestCase):
             "id": "ac178780-002e-1ce9-ffff-ffffffffffff",
             "name": "Intel TBT5 Dock",
             "status": "authorized",
+            "link": "40 Gb/s",
+            "power": None,
         }])
+
+    def test_asymmetric_link_and_power(self):
+        output = BOLT_DEVICE.format(status="authorized")
+        output += "   ├─ rx speed:  20 Gb/s = 2 lanes * 10 Gb/s\n"
+        output += "   ├─ tx speed:  40 Gb/s = 2 lanes * 20 Gb/s\n"
+        output += "   ├─ power:     15 W\n"
+        device = main.parse_bolt_devices(output)[0]
+        self.assertEqual(device["link"], "20 Gb/s RX · 40 Gb/s TX")
+        self.assertEqual(device["power"], "15 W")
 
     def test_garbage_prefix_and_crlf_keep_authorized_status(self):
         output = (
@@ -205,6 +222,8 @@ class BoltParsingTests(unittest.TestCase):
             "id": "ac178780-002e-1ce9-ffff-ffffffffffff",
             "name": "Intel TBT5 Dock",
             "status": "authorized",
+            "link": None,
+            "power": None,
         }])
 
     def test_unrecognized_error_includes_output_preview(self):
@@ -280,36 +299,53 @@ class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorized_devices_trigger_pci_scan(self):
         with patch.object(main, "bolt_status", new=AsyncMock(return_value={
             "available": True,
-            "devices": [{"id": "one", "name": "Dock", "status": "authorized"}],
+            "devices": [{"id": "one", "name": "Dock", "status": "authorized", "link": "40 Gb/s", "power": None}],
             "error": None,
-        })), patch.object(main, "pci_scan", new=AsyncMock(return_value={"ran": True, "error": None})) as scan:
+        })), patch.object(main, "pci_scan", new=AsyncMock(return_value={"ran": True, "error": None})) as scan, \
+                patch.object(main, "gpu_status", return_value=[{"address": "gpu", "driver": "amdgpu", "name": "GPU"}]):
             result = await main.Plugin().get_bolt_status()
             scan.assert_awaited_once()
             self.assertEqual(result["pci_scan"], {"ran": True, "error": None})
+            self.assertTrue(result["gpu_ready"])
+            self.assertTrue(result["gpu_on_pci"])
 
     async def test_unauthorised_devices_do_not_scan_pci(self):
         for status in ("connected", "disconnected", "authorizing"):
             with patch.object(main, "bolt_status", new=AsyncMock(return_value={
                 "available": True,
-                "devices": [{"id": "one", "name": "Dock", "status": status}],
+                "devices": [{"id": "one", "name": "Dock", "status": status, "link": None, "power": None}],
                 "error": None,
-            })), patch.object(main, "pci_scan", new=AsyncMock()) as scan:
+            })), patch.object(main, "pci_scan", new=AsyncMock()) as scan, \
+                    patch.object(main, "gpu_status", return_value=[]):
                 result = await main.Plugin().get_bolt_status()
                 scan.assert_not_awaited()
                 self.assertIsNone(result["pci_scan"])
+                self.assertFalse(result["gpu_on_pci"])
 
     async def test_lspci_failure_does_not_drop_bolt_status(self):
         with patch.object(main, "bolt_status", new=AsyncMock(return_value={
             "available": True,
-            "devices": [{"id": "one", "name": "Dock", "status": "authorized"}],
+            "devices": [{"id": "one", "name": "Dock", "status": "authorized", "link": None, "power": None}],
             "error": None,
         })), patch.object(main, "pci_scan", new=AsyncMock(return_value={
             "ran": False, "error": "lspci is not installed.",
-        })):
+        })), patch.object(main, "gpu_status", return_value=[]):
             result = await main.Plugin().get_bolt_status()
             self.assertTrue(result["available"])
             self.assertEqual(result["devices"][0]["status"], "authorized")
             self.assertEqual(result["pci_scan"]["error"], "lspci is not installed.")
+            self.assertFalse(result["gpu_ready"])
+
+    async def test_missing_sysfs_leaves_gpu_ready_unknown(self):
+        with patch.object(main, "bolt_status", new=AsyncMock(return_value={
+            "available": True,
+            "devices": [{"id": "one", "name": "Dock", "status": "authorized", "link": None, "power": None}],
+            "error": None,
+        })), patch.object(main, "pci_scan", new=AsyncMock(return_value={"ran": True, "error": None})), \
+                patch.object(main, "gpu_status", side_effect=FileNotFoundError):
+            result = await main.Plugin().get_bolt_status()
+            self.assertIsNone(result["gpu_ready"])
+            self.assertIsNone(result["gpu_on_pci"])
 
     async def test_lspci_timeout_kills_child(self):
         process = AsyncMock()

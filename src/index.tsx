@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { BsGpuCard } from "react-icons/bs";
 
 type Status = {
-  devices: { address: string; driver: string | null }[];
+  devices: { address: string; driver: string | null; name: string | null }[];
   service: Record<string, string>;
   target: Record<string, string>;
   marker: boolean;
@@ -15,8 +15,10 @@ type Status = {
 const getStatus = callable<[], Status>("get_status");
 type BoltStatus = {
   available: boolean;
-  devices: { id: string; name: string; status: string }[];
+  devices: { id: string; name: string; status: string; link: string | null; power: string | null }[];
   error: string | null;
+  gpu_on_pci?: boolean | null;
+  gpu_ready?: boolean | null;
   pci_scan?: { ran: boolean; error: string | null } | null;
 };
 const getBoltStatus = callable<[], BoltStatus>("get_bolt_status");
@@ -38,7 +40,7 @@ function BoltSection() {
         const next = await getBoltStatus();
         if (!disposed) setBolt(next);
       } catch (failure) {
-        if (!disposed) setBolt({ available: false, devices: [], error: errorText(failure) });
+        if (!disposed) setBolt({ available: false, devices: [], error: errorText(failure), gpu_on_pci: null, gpu_ready: null });
       } finally {
         fetching = false;
         if (!disposed) {
@@ -54,8 +56,9 @@ function BoltSection() {
     };
   }, []);
 
+  const pciNote = bolt?.gpu_ready ? "GPU ready" : bolt?.gpu_on_pci ? "On PCI · Driver not ready" : bolt?.gpu_on_pci === false ? "GPU not on PCI" : null;
   const labels: Record<string, string> = {
-    authorized: "Authorized",
+    authorized: pciNote ? `Authorized · ${pciNote}` : "Authorized",
     connected: "Connected · Not authorized",
     disconnected: "Disconnected",
     connecting: "Connecting",
@@ -64,7 +67,7 @@ function BoltSection() {
     unknown: "Unknown",
   };
   return (
-    <PanelSection title="Thunderbolt / USB4 · boltctl">
+    <PanelSection title="Thunderbolt / USB4">
       <PanelSectionRow>
         <div role="status">
           {!bolt ? "Checking boltctl…" : !bolt.available
@@ -77,6 +80,8 @@ function BoltSection() {
           <div>
             <strong>{device.name}</strong>
             <div>{labels[device.status] ?? device.status}</div>
+            {device.link && <div>{device.link}</div>}
+            {device.power && <div>Power {device.power}</div>}
           </div>
         </PanelSectionRow>
       ))}
@@ -146,12 +151,12 @@ function Content() {
 
   return (
     <>
-    <PanelSection title="eGPU · 1002:73ff">
+    <PanelSection title="eGPU">
       <PanelSectionRow>
         <div role="status">
-          <strong>{status ? (status.devices.length ? "Connected" : "Disconnected") : (error ? "Status unavailable" : "Checking connection…")}</strong>
+          <strong>{status ? (status.devices.some(device => device.driver === "amdgpu") ? "GPU ready" : status.devices.length ? "On PCI · Driver not ready" : "GPU not on PCI") : (error ? "Status unavailable" : "Checking connection…")}</strong>
           {status?.devices.map(device => (
-            <div key={device.address}>{device.address} · {device.driver ?? "Driver not ready"}</div>
+            <div key={device.address}>{device.name || "GPU"}{device.driver ? ` · ${device.driver}` : ""}</div>
           ))}
         </div>
       </PanelSectionRow>
@@ -164,14 +169,14 @@ function Content() {
             <ConfirmModal
               strTitle="Restart Gamescope?"
               strDescription="This may close your game and restart Steam. Save first."
-              strOKButtonText="Restart Gamescope"
+              strOKButtonText="Restart"
               strCancelButtonText="Cancel"
               bDestructiveWarning
               onOK={() => { void restart(); }}
             />,
           )}
         >
-          {running || status?.busy ? "Restart requested…" : "Restart Gamescope"}
+          {running || status?.busy ? "Restart requested…" : "Restart"}
         </ButtonItem>
       </PanelSectionRow>
       {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}

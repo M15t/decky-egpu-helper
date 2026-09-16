@@ -2,9 +2,10 @@
 
 A standalone Decky plugin for the eGPU with PCI ID `1002:73ff`.
 
-- Read connection and driver status from PCI sysfs every two seconds.
-- Show each device reported by `boltctl list`, including authorized, connected
-  (not yet authorized), and disconnected states. This includes non-eGPU devices.
+- Show the GPU marketing name when sysfs has one, plus PCI ready vs not on PCI.
+- Show Thunderbolt authorized/connected/disconnected, link speed, and power if
+  boltctl reports them. Authorized plus GPU-not-on-PCI is a failed PCIe probe,
+  not a rendering success.
 - Manually restart `gamescope-session.target` after confirmation.
 
 Thunderbolt/USB4 status loads once when the panel opens. **Refresh** fetches it
