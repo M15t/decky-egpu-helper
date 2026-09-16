@@ -30,6 +30,28 @@ class DetectionTests(unittest.TestCase):
                 (device / "device").write_text("0x9999")
                 self.assertEqual(main.gpu_status(), [])
 
+    def test_lspci_name_for_matching_id(self):
+        output = (
+            "0000:05:00.0 VGA compatible controller [0300]: "
+            "Advanced Micro Devices, Inc. [AMD/ATI] "
+            "Navi 21 [Radeon RX 6800/6800 XT / 6900 XT] [1002:73ff] (rev c1)\n"
+            "0000:63:00.0 VGA compatible controller [0300]: "
+            "Advanced Micro Devices, Inc. [AMD/ATI] Device [1002:15bf]\n"
+        )
+        names = main.parse_lspci_names(output)
+        self.assertEqual(
+            names["0000:05:00.0"],
+            "Advanced Micro Devices, Inc. [AMD/ATI] Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]",
+        )
+        self.assertEqual(names["05:00.0"], names["0000:05:00.0"])
+        self.assertNotIn("0000:63:00.0", names)
+        devices = [{"address": "0000:05:00.0", "name": None, "driver": "amdgpu"}]
+        main.apply_lspci_names(devices, output)
+        self.assertIn("Navi 21", devices[0]["name"])
+        untitled = [{"address": "0000:05:00.0", "name": None}]
+        main.apply_lspci_names(untitled, "00:00.0 VGA compatible controller [0300]: Other [10de:1234]")
+        self.assertIsNone(untitled[0]["name"])
+
     def test_missing_sysfs_is_not_disconnected(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(main, "PCI_DEVICES", Path(folder) / "missing"):
@@ -50,7 +72,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.unit_mock = self.unit.start()
         self.command = patch.object(main, "systemctl", new=AsyncMock(return_value=""))
         self.command_mock = self.command.start()
+        self.scan = patch.object(main, "pci_scan", new=AsyncMock(return_value={"ran": True, "error": None, "output": ""}))
+        self.scan.start()
         self.addCleanup(patch.stopall)
+
+    async def test_fills_gpu_name_from_lspci(self):
+        self.gpu_mock.return_value = [{"address": "0000:05:00.0", "driver": "amdgpu", "name": None}]
+        self.plugin._lspci_names = {}
+        self.plugin._lspci_at = 0
+        with patch.object(main, "pci_scan", new=AsyncMock(return_value={
+            "ran": True,
+            "error": None,
+            "output": "0000:05:00.0 VGA compatible controller [0300]: Navi 21 [Radeon RX 6800 XT] [1002:73ff]\n",
+        })):
+            status = await self.plugin.get_status()
+        self.assertEqual(status["devices"][0]["name"], "Navi 21 [Radeon RX 6800 XT]")
 
     async def test_queue_and_cooldown(self):
         self.assertTrue((await self.plugin.get_status())["can_restart"])
@@ -291,7 +327,9 @@ class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
         process.communicate.return_value = (b"00:00.0", b"")
         with patch("main.asyncio.create_subprocess_exec", return_value=process) as spawn:
             result = await main.pci_scan()
-            self.assertEqual(result, {"ran": True, "error": None})
+            self.assertTrue(result["ran"])
+            self.assertIsNone(result["error"])
+            self.assertIn("00:00.0", result["output"])
             args, kwargs = spawn.call_args
             self.assertEqual(args, ("/usr/bin/lspci", "-Dnn"))
             self.assertNotIn("LD_PRELOAD", kwargs["env"])

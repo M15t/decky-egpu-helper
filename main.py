@@ -38,6 +38,41 @@ def gpu_label(device):
     return None
 
 
+LSPCI_GPU = re.compile(
+    r"^(?:([0-9a-f:.]+)\s+)?(?:VGA compatible controller|3D controller|Display controller)"
+    r"\s+\[[0-9a-f]+\]:\s+(.+?)\s+\[1002:73ff\]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_lspci_names(output):
+    names = {}
+    for match in LSPCI_GPU.finditer(output or ""):
+        address, name = match.group(1), match.group(2).strip()
+        if not name:
+            continue
+        if address:
+            names[address] = name
+            if ":" in address:
+                names[address.split(":", 1)[1]] = name
+        names["1002:73ff"] = name
+    return names
+
+
+def apply_lspci_names(devices, output):
+    names = parse_lspci_names(output)
+    for device in devices:
+        if device.get("name"):
+            continue
+        address = device.get("address") or ""
+        device["name"] = (
+            names.get(address)
+            or names.get(address.split(":", 1)[-1])
+            or names.get("1002:73ff")
+        )
+    return devices
+
+
 def gpu_status():
     devices = []
     # An unavailable sysfs is an error, not a disconnected GPU.
@@ -210,39 +245,71 @@ async def pci_scan():
             raise
         if process.returncode:
             raise RuntimeError(stderr.decode(errors="replace").strip() or "lspci failed.")
-        return {"ran": True, "error": None}
+        return {"ran": True, "error": None, "output": stdout.decode(errors="replace")}
     except FileNotFoundError:
         error = "lspci is not installed."
     except asyncio.TimeoutError:
         error = "lspci timed out."
     except (OSError, RuntimeError) as failure:
         error = str(failure)
-    return {"ran": False, "error": error}
+    return {"ran": False, "error": error, "output": ""}
 
 
 class Plugin:
     def __init__(self):
         self._restart_lock = asyncio.Lock()
         self._cooldown_until = 0.0
+        self._lspci_names = {}
+        self._lspci_at = 0.0
+
+    async def lspci_names(self):
+        if self._lspci_names and time.monotonic() - self._lspci_at < 5:
+            return self._lspci_names
+        scan = await pci_scan()
+        names = parse_lspci_names(scan.get("output") or "")
+        if names or scan.get("ran"):
+            self._lspci_names = names
+            self._lspci_at = time.monotonic()
+        return names
+
+    async def named_gpus(self):
+        devices = await asyncio.to_thread(gpu_status)
+        if any(not device.get("name") for device in devices):
+            names = await self.lspci_names()
+            for device in devices:
+                if device.get("name"):
+                    continue
+                address = device.get("address") or ""
+                device["name"] = (
+                    names.get(address)
+                    or names.get(address.split(":", 1)[-1])
+                    or names.get("1002:73ff")
+                )
+        return devices
 
     async def get_bolt_status(self):
         result = await bolt_status()
+        if result["available"] and any(device["status"] == "authorized" for device in result["devices"]):
+            scan = await pci_scan()
+            result["pci_scan"] = scan
+            names = parse_lspci_names(scan.get("output") or "")
+            if names or scan.get("ran"):
+                self._lspci_names = names
+                self._lspci_at = time.monotonic()
+        else:
+            result["pci_scan"] = None
         try:
-            gpus = await asyncio.to_thread(gpu_status)
+            gpus = await self.named_gpus()
             result["gpu_on_pci"] = bool(gpus)
             result["gpu_ready"] = any(device.get("driver") == "amdgpu" for device in gpus)
         except FileNotFoundError:
             # Missing sysfs is not "GPU unplugged". Leave PCI unknown.
             result["gpu_on_pci"] = None
             result["gpu_ready"] = None
-        if result["available"] and any(device["status"] == "authorized" for device in result["devices"]):
-            result["pci_scan"] = await pci_scan()
-        else:
-            result["pci_scan"] = None
         return result
 
     async def get_status(self):
-        devices = await asyncio.to_thread(gpu_status)
+        devices = await self.named_gpus()
         service, target = await asyncio.gather(unit_status(SERVICE), unit_status(TARGET))
         busy = self._restart_lock.locked() or time.monotonic() < self._cooldown_until
         ready = (
