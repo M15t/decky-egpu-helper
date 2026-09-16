@@ -4,7 +4,16 @@ A standalone Decky plugin for the eGPU with PCI ID `1002:73ff`.
 
 - Read connection and driver status from PCI sysfs every two seconds.
 - Show the existing `egpu-gamescope-fix.service` state and script marker.
+- Show each device reported by `boltctl list`, including authorized, connected
+  (not yet authorized), and disconnected states. This includes non-eGPU devices.
 - Manually restart `gamescope-session.target` after confirmation.
+
+Thunderbolt/USB4 status is read-only and refreshes independently every two
+seconds after each response. It requires `/usr/bin/boltctl` and a working boltd
+service. Missing tools, timeouts, and errors appear separately without blocking
+PCI status or restart controls. An empty list means no devices were reported,
+not proof that a specific eGPU is disconnected. Authorization is not proof of
+GPU rendering. The plugin never enrolls or authorizes devices.
 
 The plugin runs as the Decky installation user, **without root**. It does not
 install, modify, or execute your existing script. Your automatic service can
@@ -32,7 +41,7 @@ pnpm test
 pnpm package
 ```
 
-Enable Decky developer mode and install `egpu-gamescope.zip`. This package is
+Enable Decky developer mode and install `decky-egpu-helper.zip`. This package is
 independent of the ROG Ally controller plugin.
 
 ## Hardware checks

@@ -1,6 +1,7 @@
 import asyncio
 import os
 from pathlib import Path
+import re
 import time
 
 
@@ -62,10 +63,81 @@ async def unit_status(unit):
     return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
 
 
+def parse_bolt_devices(output):
+    devices = []
+    current = {}
+    # boltctl uses tree prefixes and may emit terminal color sequences.
+    output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    for line in output.splitlines():
+        field = re.match(r"^[\s│├└─]*?(type|name|vendor|uuid|status):\s*(.*?)\s*$", line)
+        if not field:
+            continue
+        key, value = field.groups()
+        if key == "type" and current:
+            devices.append(current)
+            current = {}
+        current[key] = value
+    if current:
+        devices.append(current)
+    if output.strip() and not devices:
+        raise ValueError("Unrecognized boltctl output.")
+    result = []
+    for device in devices:
+        if device.get("type") == "host":
+            continue
+        if not device.get("uuid") or not device.get("status"):
+            raise ValueError("Incomplete boltctl device status.")
+        result.append({
+            "id": device["uuid"],
+            "name": " ".join(filter(None, (device.get("vendor"), device.get("name"))))
+                    or "Thunderbolt device",
+            "status": device["status"],
+        })
+    return result
+
+
+async def bolt_status():
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+    env.update({"LC_ALL": "C", "TERM": "dumb", "NO_COLOR": "1"})
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/boltctl", "list",
+            env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                process.kill()
+            await process.communicate()
+            raise
+        if process.returncode:
+            raise RuntimeError(
+                stderr.decode(errors="replace").strip() or "boltctl failed."
+            )
+        return {
+            "available": True,
+            "devices": parse_bolt_devices(stdout.decode(errors="replace")),
+            "error": None,
+        }
+    except FileNotFoundError:
+        error = "boltctl is not installed."
+    except asyncio.TimeoutError:
+        error = "boltctl timed out. Check the boltd service."
+    except (OSError, RuntimeError, ValueError) as failure:
+        error = str(failure)
+    return {"available": False, "devices": [], "error": error}
+
+
 class Plugin:
     def __init__(self):
         self._restart_lock = asyncio.Lock()
         self._cooldown_until = 0.0
+
+    async def get_bolt_status(self):
+        return await bolt_status()
 
     async def get_status(self):
         devices = await asyncio.to_thread(gpu_status)

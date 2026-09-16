@@ -7,7 +7,7 @@ files = ("dist/index.js", "main.py", "plugin.json", "package.json", "README.md")
 for name in files:
     if not (root / name).is_file():
         raise SystemExit(f"Missing {name}; run pnpm build first.")
-with ZipFile(root / "egpu-gamescope.zip", "w", ZIP_DEFLATED) as archive:
+with ZipFile(root / "decky-egpu-helper.zip", "w", ZIP_DEFLATED) as archive:
     for name in files:
         archive.write(root / name, f"egpu-gamescope/{name}")
-print(root / "egpu-gamescope.zip")
+print(root / "decky-egpu-helper.zip")

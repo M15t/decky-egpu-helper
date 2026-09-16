@@ -113,3 +113,100 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("LD_LIBRARY_PATH", kwargs["env"])
             self.assertEqual(kwargs["env"]["DBUS_SESSION_BUS_ADDRESS"],
                              "unix:path=/run/user/1000/bus")
+
+
+BOLT_DEVICE = """ ● Razer Core X
+   ├─ type:          peripheral
+   ├─ name:          Core X
+   ├─ vendor:        Razer
+   ├─ uuid:          device-one
+   ├─ status:        {status}
+   │  ├─ domain:    domain-one
+   │  └─ authflags: none
+   └─ stored:        yes
+      └─ policy:     auto
+"""
+
+
+class BoltParsingTests(unittest.TestCase):
+    def test_statuses(self):
+        for status in ("authorized", "connected", "disconnected", "connecting",
+                       "authorizing", "auth-error", "unknown", "future-state"):
+            with self.subTest(status=status):
+                self.assertEqual(main.parse_bolt_devices(BOLT_DEVICE.format(status=status)), [
+                    {"id": "device-one", "name": "Razer Core X", "status": status},
+                ])
+
+    def test_multiple_devices_and_color(self):
+        output = BOLT_DEVICE.format(status="\x1b[32mauthorized\x1b[0m")
+        output += BOLT_DEVICE.format(status="disconnected").replace("device-one", "device-two")
+        devices = main.parse_bolt_devices(output)
+        self.assertEqual([device["status"] for device in devices],
+                         ["authorized", "disconnected"])
+        self.assertEqual(devices[1]["id"], "device-two")
+
+    def test_empty_and_host_only(self):
+        self.assertEqual(main.parse_bolt_devices(""), [])
+        self.assertEqual(main.parse_bolt_devices(
+            BOLT_DEVICE.format(status="authorized").replace("peripheral", "host")
+        ), [])
+
+    def test_invalid_output_is_not_disconnected(self):
+        for output in ("unexpected output", "type: peripheral\nname: incomplete"):
+            with self.assertRaises(ValueError):
+                main.parse_bolt_devices(output)
+
+
+class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_only_command_and_environment(self):
+        process = AsyncMock()
+        process.returncode = 0
+        process.communicate.return_value = (
+            BOLT_DEVICE.format(status="connected").encode(), b"",
+        )
+        with patch.dict("main.os.environ", {"LD_PRELOAD": "bad", "LD_LIBRARY_PATH": "bad"}), \
+                patch("main.asyncio.create_subprocess_exec", return_value=process) as spawn:
+            result = await main.Plugin().get_bolt_status()
+            self.assertTrue(result["available"])
+            self.assertEqual(result["devices"][0]["status"], "connected")
+            args, kwargs = spawn.call_args
+            self.assertEqual(args, ("/usr/bin/boltctl", "list"))
+            self.assertEqual(kwargs["env"]["LC_ALL"], "C")
+            self.assertNotIn("LD_PRELOAD", kwargs["env"])
+            self.assertNotIn("LD_LIBRARY_PATH", kwargs["env"])
+
+    async def test_missing_tool(self):
+        with patch("main.asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
+            result = await main.bolt_status()
+            self.assertFalse(result["available"])
+            self.assertIn("not installed", result["error"])
+
+    async def test_daemon_failure(self):
+        process = AsyncMock()
+        process.returncode = 1
+        process.communicate.return_value = (b"", b"Could not connect to boltd")
+        with patch("main.asyncio.create_subprocess_exec", return_value=process):
+            result = await main.bolt_status()
+            self.assertFalse(result["available"])
+            self.assertIn("boltd", result["error"])
+
+    async def test_timeout_kills_child(self):
+        process = AsyncMock()
+        process.returncode = None
+        from unittest.mock import Mock
+        process.kill = Mock()
+        process.communicate.side_effect = [asyncio.TimeoutError(), (b"", b"")]
+        with patch("main.asyncio.create_subprocess_exec", return_value=process):
+            result = await main.bolt_status()
+            self.assertFalse(result["available"])
+            self.assertIn("timed out", result["error"])
+            process.kill.assert_called_once()
+
+    async def test_unrecognized_output_reports_error(self):
+        process = AsyncMock()
+        process.returncode = 0
+        process.communicate.return_value = (b"unsupported output", b"")
+        with patch("main.asyncio.create_subprocess_exec", return_value=process):
+            result = await main.bolt_status()
+            self.assertFalse(result["available"])
+            self.assertIn("Unrecognized", result["error"])

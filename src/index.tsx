@@ -13,8 +13,69 @@ type Status = {
 };
 
 const getStatus = callable<[], Status>("get_status");
+type BoltStatus = {
+  available: boolean;
+  devices: { id: string; name: string; status: string }[];
+  error: string | null;
+};
+const getBoltStatus = callable<[], BoltStatus>("get_bolt_status");
 const restartGamescope = callable<[], { message: string }>("restart_gamescope");
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+function BoltSection() {
+  const [bolt, setBolt] = useState<BoltStatus | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const next = await getBoltStatus();
+        if (!disposed) setBolt(next);
+      } catch (failure) {
+        if (!disposed) setBolt({ available: false, devices: [], error: errorText(failure) });
+      } finally {
+        if (!disposed) timer = setTimeout(refresh, 2000);
+      }
+    };
+    void refresh();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, []);
+
+  const labels: Record<string, string> = {
+    authorized: "Authorized",
+    connected: "Connected · Not authorized",
+    disconnected: "Disconnected",
+    connecting: "Connecting",
+    authorizing: "Authorizing",
+    "auth-error": "Authorization failed",
+    unknown: "Unknown",
+  };
+  return (
+    <PanelSection title="Thunderbolt / USB4 · boltctl">
+      <PanelSectionRow>
+        <div role="status">
+          {!bolt ? "Checking boltctl…" : !bolt.available
+            ? `Status unavailable: ${bolt.error ?? "Unknown error"}`
+            : !bolt.devices.length ? "No devices listed by boltctl" : null}
+        </div>
+      </PanelSectionRow>
+      {bolt?.devices.map(device => (
+        <PanelSectionRow key={device.id}>
+          <div>
+            <strong>{device.name}</strong>
+            <div>{labels[device.status] ?? device.status}</div>
+          </div>
+        </PanelSectionRow>
+      ))}
+      <PanelSectionRow>
+        <div style={{ fontSize: 12 }}>
+          All devices reported by boltctl, not only the eGPU.
+          Authorization does not confirm GPU rendering.
+        </div>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
 
 function Content() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -63,6 +124,7 @@ function Content() {
   };
 
   return (
+    <>
     <PanelSection title="eGPU · 1002:73ff">
       <PanelSectionRow>
         <div role="status">
@@ -110,6 +172,8 @@ function Content() {
       </PanelSectionRow>
       {message && <PanelSectionRow><div role="status">{message}</div></PanelSectionRow>}
     </PanelSection>
+    <BoltSection />
+    </>
   );
 }
 
