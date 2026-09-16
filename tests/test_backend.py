@@ -55,12 +55,22 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self.plugin.restart_gamescope()
 
-    async def test_unplug_or_unbound_blocks_restart(self):
+    async def test_restart_does_not_require_gpu_detection(self):
         for devices in ([], [{"address": "gpu", "driver": None}]):
             self.gpu_mock.return_value = devices
-            with self.assertRaises(RuntimeError):
-                await self.plugin.restart_gamescope()
-        self.command_mock.assert_not_awaited()
+            plugin = main.Plugin()
+            self.assertTrue((await plugin.get_status())["can_restart"])
+            result = await plugin.restart_gamescope()
+            self.assertIn("queued", result["message"])
+        self.assertEqual(self.command_mock.await_count, 2)
+
+    async def test_restart_still_works_when_pci_status_fails(self):
+        self.gpu_mock.side_effect = OSError("sysfs unavailable")
+        with self.assertRaises(OSError):
+            await self.plugin.get_status()
+        result = await self.plugin.restart_gamescope()
+        self.assertIn("queued", result["message"])
+        self.command_mock.assert_awaited_once_with("--no-block", "restart", main.TARGET)
 
     async def test_inactive_session_blocks_restart(self):
         self.unit_mock.return_value = {"ActiveState": "inactive"}

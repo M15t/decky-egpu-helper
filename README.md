@@ -1,15 +1,15 @@
-# eGPU Gamescope
+# eGPU Helper
 
 A standalone Decky plugin for the eGPU with PCI ID `1002:73ff`.
 
 - Read connection and driver status from PCI sysfs every two seconds.
-- Show the existing `egpu-gamescope-fix.service` state and script marker.
 - Show each device reported by `boltctl list`, including authorized, connected
   (not yet authorized), and disconnected states. This includes non-eGPU devices.
 - Manually restart `gamescope-session.target` after confirmation.
 
 Thunderbolt/USB4 status is read-only and refreshes independently every two
-seconds after each response. It requires `/usr/bin/boltctl` and a working boltd
+seconds after each response. **Refresh** fetches it immediately; overlapping
+requests are prevented. It requires `/usr/bin/boltctl` and a working boltd
 service. Missing tools, timeouts, and errors appear separately without blocking
 PCI status or restart controls. An empty list means no devices were reported,
 not proof that a specific eGPU is disconnected. Authorization is not proof of
@@ -22,8 +22,10 @@ gamescope-session.target` directly, bypassing the script's marker guard without
 removing its marker.
 
 Restart can close games and restart Steam. Save first. The button is disabled
-without an `amdgpu`-bound matching GPU, an active Gamescope target, or while the
-automatic service is starting/stopping. Requests have a 15-second cooldown.
+only while requesting a restart or during the reported 15-second cooldown.
+GPU detection, driver readiness, and status polling errors do not disable it.
+After confirmation, the backend requires an active Gamescope target and checks
+that the automatic service is not starting/stopping. Failures appear in the panel.
 “Restart queued” means systemd accepted the request, not that the fix succeeded.
 
 Connection does not prove that Gamescope or a game is rendering on the eGPU.

@@ -1,7 +1,7 @@
 import { callable, definePlugin } from "@decky/api";
 import { ButtonItem, ConfirmModal, PanelSection, PanelSectionRow, showModal } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
-import { FaPlug } from "react-icons/fa";
+import { BsGpuCard } from "react-icons/bs";
 
 type Status = {
   devices: { address: string; driver: string | null }[];
@@ -24,21 +24,37 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 
 function BoltSection() {
   const [bolt, setBolt] = useState<BoltStatus | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshNow = useRef<() => void>(() => {});
   useEffect(() => {
     let disposed = false;
+    let fetching = false;
     let timer: ReturnType<typeof setTimeout>;
     const refresh = async () => {
+      if (disposed || fetching) return;
+      fetching = true;
+      clearTimeout(timer);
+      setRefreshing(true);
       try {
         const next = await getBoltStatus();
         if (!disposed) setBolt(next);
       } catch (failure) {
         if (!disposed) setBolt({ available: false, devices: [], error: errorText(failure) });
       } finally {
-        if (!disposed) timer = setTimeout(refresh, 2000);
+        fetching = false;
+        if (!disposed) {
+          setRefreshing(false);
+          timer = setTimeout(refresh, 2000);
+        }
       }
     };
+    refreshNow.current = () => { void refresh(); };
     void refresh();
-    return () => { disposed = true; clearTimeout(timer); };
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      refreshNow.current = () => {};
+    };
   }, []);
 
   const labels: Record<string, string> = {
@@ -68,10 +84,13 @@ function BoltSection() {
         </PanelSectionRow>
       ))}
       <PanelSectionRow>
-        <div style={{ fontSize: 12 }}>
-          All devices reported by boltctl, not only the eGPU.
-          Authorization does not confirm GPU rendering.
-        </div>
+        <ButtonItem
+          layout="below"
+          disabled={refreshing}
+          onClick={() => refreshNow.current()}
+        >
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </ButtonItem>
       </PanelSectionRow>
     </PanelSection>
   );
@@ -134,32 +153,15 @@ function Content() {
           ))}
         </div>
       </PanelSectionRow>
-      {status && (
-        <>
-          <PanelSectionRow>
-            <div>
-              <div>Gamescope: {status.target.ActiveState ?? "unknown"}</div>
-              <div>Auto-fix: {status.service.LoadState === "not-found" ? "Not installed" : `${status.service.ActiveState ?? "unknown"} (${status.service.Result ?? "unknown"})`}</div>
-              <div>Script marker: {status.marker ? "Present" : "Absent"}</div>
-            </div>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <div style={{ fontSize: 12 }}>
-              Connection does not confirm Gamescope is using this GPU.
-              The script marker does not confirm a successful fix.
-            </div>
-          </PanelSectionRow>
-        </>
-      )}
       {error && <PanelSectionRow><div role="alert">{error}</div></PanelSectionRow>}
       <PanelSectionRow>
         <ButtonItem
           layout="below"
-          disabled={!status?.can_restart || running || !!error}
+          disabled={running || status?.busy === true}
           onClick={() => showModal(
             <ConfirmModal
               strTitle="Restart Gamescope?"
-              strDescription="This may close your running game and restart Steam. Save your progress first. This manually reapplies the fix without the script's once-per-session guard."
+              strDescription="This may close your game and restart Steam. Save first."
               strOKButtonText="Restart Gamescope"
               strCancelButtonText="Cancel"
               bDestructiveWarning
@@ -178,7 +180,7 @@ function Content() {
 }
 
 export default definePlugin(() => ({
-  name: "eGPU Gamescope",
+  name: "eGPU Helper",
   content: <Content />,
-  icon: <FaPlug />,
+  icon: <BsGpuCard />,
 }));

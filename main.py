@@ -144,8 +144,7 @@ class Plugin:
         service, target = await asyncio.gather(unit_status(SERVICE), unit_status(TARGET))
         busy = self._restart_lock.locked() or time.monotonic() < self._cooldown_until
         ready = (
-            any(device["driver"] == "amdgpu" for device in devices)
-            and target.get("ActiveState") == "active"
+            target.get("ActiveState") == "active"
             and service.get("ActiveState") not in ("activating", "deactivating")
             and not busy
         )
@@ -164,10 +163,8 @@ class Plugin:
         if self._restart_lock.locked() or time.monotonic() < self._cooldown_until:
             raise RuntimeError("A restart was already requested. Please wait.")
         async with self._restart_lock:
-            # Recheck hardware/session after the confirmation, not just at render time.
-            devices = await asyncio.to_thread(gpu_status)
-            if not any(device["driver"] == "amdgpu" for device in devices):
-                raise RuntimeError("eGPU 1002:73ff is not connected with the amdgpu driver.")
+            # Restart is also useful when PCI detection or the GPU driver is not ready.
+            # Check the session after confirmation instead of trusting UI polling.
             service, target = await asyncio.gather(unit_status(SERVICE), unit_status(TARGET))
             if service.get("ActiveState") in ("activating", "deactivating"):
                 raise RuntimeError("The automatic fix service is busy. Please wait.")
