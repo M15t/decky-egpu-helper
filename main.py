@@ -525,6 +525,8 @@ class Plugin:
     async def _dpi_status_with_setup(self):
         status = await dpi_status()
         installing = self._dpi_install_task is not None and not self._dpi_install_task.done()
+        if status["available"] and not installing:
+            self._dpi_install_error = None
         support_error = dpi_install_support()
         status.update({
             "installing": installing,

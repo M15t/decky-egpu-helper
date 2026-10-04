@@ -149,6 +149,31 @@ class InstallButtonTests(unittest.IsolatedAsyncioTestCase):
         return {"available": installed, "installed": installed, "enabled": False,
                 "requested": False, "busy": False, "state": "inactive", "error": None}
 
+    async def test_external_install_clears_previous_auth_error_on_poll(self):
+        plugin = main.Plugin()
+        plugin._dpi_install_error = "No authentication dialog. Try Desktop Mode."
+        with patch.object(main, "dpi_status", AsyncMock(return_value=self.status(True))):
+            status = await plugin.get_dpi_status()
+        self.assertIsNone(status["install_error"])
+        self.assertIsNone(plugin._dpi_install_error)
+        self.assertFalse(status["enabled"])
+
+    async def test_unavailable_helper_preserves_setup_error(self):
+        plugin = main.Plugin()
+        plugin._dpi_install_error = "Installation failed"
+        with patch.object(main, "dpi_status", AsyncMock(return_value=self.status(False))):
+            status = await plugin.get_dpi_status()
+        self.assertEqual(status["install_error"], "Installation failed")
+
+    async def test_clear_old_setup_error_preserves_runtime_failure(self):
+        plugin = main.Plugin()
+        plugin._dpi_install_error = "Previous authorization failed"
+        current = {**self.status(True), "state": "failed", "error": "Zapret2 failed: exit-code"}
+        with patch.object(main, "dpi_status", AsyncMock(return_value=current)):
+            status = await plugin.get_dpi_status()
+        self.assertIsNone(status["install_error"])
+        self.assertEqual(status["error"], "Zapret2 failed: exit-code")
+
     async def test_click_starts_only_one_install_without_blocking_status(self):
         gate = asyncio.Event()
         process = Mock(returncode=0)

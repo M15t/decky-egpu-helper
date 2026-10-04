@@ -224,7 +224,7 @@ function DpiToggle() {
         {status.installing ? "Installing helper…" : "Install helper"}
       </ButtonItem>
     </PanelSectionRow>}
-    {status?.install_error && status.installed !== false && !status.installing && <PanelSectionRow>
+    {status?.install_error && !status.available && status.installed !== false && !status.installing && <PanelSectionRow>
       <Field label="Helper setup" childrenLayout="below" bottomSeparator="none">{status.install_error}</Field>
     </PanelSectionRow>}
   </>;
