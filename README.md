@@ -62,9 +62,24 @@ independent of the ROG Ally controller plugin.
 ## Zapret2 helper (one-time Linux setup)
 
 Requires x86_64 Linux, systemd, polkit, Python 3 at `/usr/bin/python3`, nftables,
-and kernel NFQUEUE support. The ZIP includes the prepared runtime. Extract it
-and open a terminal in `egpu-gamescope/zapret2`. Install nftables using your
-distribution's supported package mechanism if missing. Then run, replacing
+and kernel NFQUEUE support. The ZIP includes the prepared runtime.
+
+In **Tools**, select **Install helper** and approve the Linux administrator
+prompt. The plugin detects the Decky account automatically, uses the bundled
+installer, and refreshes status when setup finishes. Setup leaves DPI bypass
+OFF; turn it ON afterwards if wanted. No password is collected or stored by
+the plugin, and its backend remains non-root. Installation requires your
+explicit button press; it never runs automatically on plugin load.
+
+This button needs `/usr/bin/pkexec` and a working polkit authentication agent
+for the calling session. Gaming Mode or service-hosted Decky may not provide
+one. If no prompt is available, the plugin reports the error; try Desktop
+Mode, or use the terminal fallback below. Existing installations are never
+overwritten by this button. Missing nftables must still be installed with
+your distribution's supported package mechanism.
+
+**Terminal fallback:** extract the ZIP and open a terminal in
+`egpu-gamescope/zapret2`. Run, replacing
 `YOUR_DECKY_USER` with the non-root account running Decky:
 
 ```sh

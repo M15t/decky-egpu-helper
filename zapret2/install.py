@@ -1,4 +1,4 @@
-"""One-time offline Linux setup. Never invoked by the Decky plugin."""
+"""One-time offline Linux setup, elevated through pkexec or run manually."""
 import argparse
 import json
 import os

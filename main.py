@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import platform
+import pwd
 import re
 import time
 
@@ -439,6 +441,20 @@ async def pci_scan():
 
 DPI_SERVICE = "decky-zapret2.service"
 DPI_ENABLED_FILE = Path("/var/lib/decky-zapret2/enabled")
+DPI_INSTALLER = Path(__file__).resolve().parent / "zapret2/install.py"
+PKEXEC = Path("/usr/bin/pkexec")
+
+
+def dpi_install_support():
+    if os.geteuid() == 0:
+        return "Decky must run as its non-root user."
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        return "Helper installation requires x86_64 Linux."
+    if not PKEXEC.is_file():
+        return "Linux administrator authentication is unavailable. Use the README terminal setup."
+    if not DPI_INSTALLER.is_file():
+        return "Installer is missing. Reinstall the plugin ZIP."
+    return None
 
 
 async def dpi_systemctl(operation):
@@ -462,9 +478,10 @@ async def dpi_systemctl(operation):
             pass
         await process.communicate()
         raise
-    if process.returncode:
+    output = stdout.decode(errors="replace")
+    if process.returncode and not (operation == "show" and "LoadState=not-found" in output.splitlines()):
         raise RuntimeError(stderr.decode(errors="replace").strip() or "DPI service command failed")
-    return stdout.decode(errors="replace")
+    return output
 
 
 async def dpi_status():
@@ -483,7 +500,7 @@ async def dpi_status():
         busy = state in ("activating", "deactivating", "reloading")
         if available and not busy and requested != enabled and not error:
             error = "Saved ON, but service is not running." if requested else "Saved OFF, but service is still running."
-        return {"available": available, "enabled": enabled, "requested": requested, "busy": busy, "state": state, "error": error}
+        return {"available": available, "installed": fields.get("LoadState") == "loaded", "enabled": enabled, "requested": requested, "busy": busy, "state": state, "error": error}
     except Exception as error:
         return {"available": False, "enabled": False, "requested": None, "busy": False, "state": "unknown", "error": str(error) or type(error).__name__}
 
@@ -491,6 +508,8 @@ async def dpi_status():
 class Plugin:
     def __init__(self):
         self._dpi_lock = asyncio.Lock()
+        self._dpi_install_task = None
+        self._dpi_install_error = None
         self._restart_lock = asyncio.Lock()
         self._cooldown_until = 0.0
         self._lspci_names = {}
@@ -501,12 +520,69 @@ class Plugin:
 
     async def get_dpi_status(self):
         async with self._dpi_lock:
-            return await dpi_status()
+            return await self._dpi_status_with_setup()
+
+    async def _dpi_status_with_setup(self):
+        status = await dpi_status()
+        installing = self._dpi_install_task is not None and not self._dpi_install_task.done()
+        support_error = dpi_install_support()
+        status.update({
+            "installing": installing,
+            "can_install": not status.get("installed", True) and not support_error and not installing,
+            "install_error": self._dpi_install_error,
+            "install_hint": support_error,
+        })
+        return status
+
+    async def install_dpi_helper(self):
+        # No paths, commands, usernames or passwords accepted from the frontend.
+        async with self._dpi_lock:
+            status = await self._dpi_status_with_setup()
+            if not status["can_install"]:
+                return status
+            self._dpi_install_error = None
+            user = pwd.getpwuid(os.geteuid()).pw_name
+            self._dpi_install_task = asyncio.create_task(self._install_dpi_helper(user))
+            status.update({"installing": True, "can_install": False, "install_error": None})
+            return status
+
+    async def _install_dpi_helper(self, user):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                str(PKEXEC), "--disable-internal-agent", "/usr/bin/python3", "-E", "-s",
+                str(DPI_INSTALLER), "--user", user,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, cwd="/",
+            )
+            # Do not block Decky's RPC or status polling during authentication.
+            # Once authorized, the root installer may outlive this plugin; never
+            # kill it mid-install or claim that a timeout cancelled installation.
+            communication = asyncio.create_task(process.communicate())
+            try:
+                _, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=120)
+            except asyncio.TimeoutError:
+                self._dpi_install_error = "Still waiting for administrator approval or setup. Check the Linux authentication dialog; do not start another installation."
+                _, stderr = await communication
+            if process.returncode == 126:
+                raise RuntimeError("Installation cancelled. You can try again.")
+            if process.returncode == 127:
+                raise RuntimeError("Administrator authorization failed or no authentication dialog is available. Try from Desktop Mode; if no prompt appears, use the README terminal setup.")
+            if process.returncode:
+                raise RuntimeError(stderr.decode(errors="replace").strip()[-2000:] or "Helper installation failed. See README setup requirements.")
+            status = await dpi_status()
+            if not status["available"]:
+                raise RuntimeError(status["error"] or "Setup finished but the helper is unavailable.")
+            self._dpi_install_error = None
+        except Exception as error:
+            self._dpi_install_error = str(error) or type(error).__name__
 
     async def set_dpi_enabled(self, enabled):
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
         async with self._dpi_lock:
+            if self._dpi_install_task is not None and not self._dpi_install_task.done():
+                return await self._dpi_status_with_setup()
             try:
                 # Save intent before changing runtime state. Shutdown stops the
                 # service without changing this marker, so boot can restore ON.
@@ -524,10 +600,10 @@ class Plugin:
                     DPI_ENABLED_FILE.unlink(missing_ok=True)
                 await dpi_systemctl("start" if enabled else "stop")
             except Exception as error:
-                status = await dpi_status()
+                status = await self._dpi_status_with_setup()
                 status["error"] = str(error) or type(error).__name__
                 return status
-            status = await dpi_status()
+            status = await self._dpi_status_with_setup()
             if status["enabled"] != enabled and not status["error"]:
                 status["error"] = "Service did not reach the requested state; check its journal."
             return status

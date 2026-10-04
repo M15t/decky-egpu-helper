@@ -94,6 +94,13 @@ class DpiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawn.call_args.args, ("/usr/bin/systemctl", "--system", "--no-ask-password", "start", "decky-zapret2.service"))
         self.assertEqual(spawn.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
 
+    async def test_missing_unit_show_still_allows_install_status(self):
+        process = Mock(returncode=1, communicate=AsyncMock(return_value=(fields(loaded="not-found", state="inactive", pid="0", sub="dead").encode(), b"Unit not found")))
+        with patch.object(main.os, "geteuid", return_value=1000), patch.object(main.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
+            status = await main.dpi_status()
+        self.assertFalse(status["installed"])
+        self.assertEqual(status["state"], "inactive")
+
     async def test_reject_root_and_arbitrary_operations(self):
         with patch.object(main.asyncio, "create_subprocess_exec", AsyncMock()) as spawn:
             with self.assertRaises(ValueError):
@@ -135,6 +142,93 @@ class DpiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "dpi_systemctl", side_effect=control):
             await asyncio.gather(plugin.set_dpi_enabled(True), plugin.set_dpi_enabled(False), plugin.get_dpi_status())
         self.assertEqual(events, ["start", "show", "stop", "show", "show"])
+
+
+class InstallButtonTests(unittest.IsolatedAsyncioTestCase):
+    def status(self, installed=False):
+        return {"available": installed, "installed": installed, "enabled": False,
+                "requested": False, "busy": False, "state": "inactive", "error": None}
+
+    async def test_click_starts_only_one_install_without_blocking_status(self):
+        gate = asyncio.Event()
+        process = Mock(returncode=0)
+        async def communicate():
+            await gate.wait()
+            return b"Installed", b""
+        process.communicate = AsyncMock(side_effect=communicate)
+        plugin = main.Plugin()
+        with patch.object(main, "dpi_install_support", return_value=None), \
+             patch.object(main, "dpi_status", AsyncMock(side_effect=lambda: self.status(gate.is_set()))), \
+             patch.object(main.os, "geteuid", return_value=1000), \
+             patch.object(main.pwd, "getpwuid", return_value=Mock(pw_name="deck")), \
+             patch.object(main.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)) as spawn:
+            first = await plugin.install_dpi_helper()
+            self.assertTrue(first["installing"])
+            await asyncio.sleep(0)
+            again = await plugin.install_dpi_helper()
+            self.assertTrue(again["installing"])
+            current = await plugin.get_dpi_status()
+            self.assertFalse(current["can_install"])
+            self.assertFalse(current["available"])
+            spawn.assert_awaited_once()
+            self.assertEqual(spawn.call_args.args, (
+                str(main.PKEXEC), "--disable-internal-agent", "/usr/bin/python3", "-E", "-s",
+                str(main.DPI_INSTALLER), "--user", "deck"))
+            self.assertEqual(spawn.call_args.kwargs["stdin"], asyncio.subprocess.DEVNULL)
+            self.assertEqual(spawn.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            gate.set()
+            await plugin._dpi_install_task
+            self.assertTrue((await plugin.get_dpi_status())["available"])
+            self.assertIsNone(plugin._dpi_install_error)
+
+    async def test_existing_or_unsupported_installation_does_not_elevate(self):
+        for installed, reason in ((True, None), (False, "No pkexec")):
+            with patch.object(main, "dpi_install_support", return_value=reason), \
+                 patch.object(main, "dpi_status", AsyncMock(return_value=self.status(installed))), \
+                 patch.object(main.asyncio, "create_subprocess_exec", AsyncMock()) as spawn:
+                result = await main.Plugin().install_dpi_helper()
+                self.assertFalse(result["can_install"])
+                spawn.assert_not_called()
+
+    async def test_auth_cancel_and_missing_agent_are_actionable(self):
+        for code, expected in ((126, "cancelled"), (127, "Desktop Mode"), (1, "Missing nftables")):
+            plugin = main.Plugin()
+            process = Mock(returncode=code, communicate=AsyncMock(return_value=(b"", b"Missing nftables")))
+            with patch.object(main.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)):
+                await plugin._install_dpi_helper("deck")
+            self.assertIn(expected, plugin._dpi_install_error)
+
+    async def test_exit_zero_requires_installed_service_verification(self):
+        process = Mock(returncode=0, communicate=AsyncMock(return_value=(b"", b"")))
+        plugin = main.Plugin()
+        with patch.object(main.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+             patch.object(main, "dpi_status", AsyncMock(return_value=self.status(False))):
+            await plugin._install_dpi_helper("deck")
+        self.assertIn("unavailable", plugin._dpi_install_error)
+
+    async def test_slow_authorization_remains_in_progress_without_second_install(self):
+        gate = asyncio.Event()
+        async def communicate():
+            await gate.wait()
+            return b"", b""
+        process = Mock(returncode=126, communicate=AsyncMock(side_effect=communicate))
+        plugin = main.Plugin()
+        with patch.object(main.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+             patch.object(main.asyncio, "wait_for", AsyncMock(side_effect=asyncio.TimeoutError())):
+            task = asyncio.create_task(plugin._install_dpi_helper("deck"))
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertIn("Still waiting", plugin._dpi_install_error)
+            process.kill.assert_not_called()
+            gate.set()
+            await task
+        self.assertIn("cancelled", plugin._dpi_install_error)
+
+    def test_root_and_unsupported_host_cannot_use_install_button(self):
+        with patch.object(main.os, "geteuid", return_value=0):
+            self.assertIn("non-root", main.dpi_install_support())
+        with patch.object(main.os, "geteuid", return_value=1000), patch.object(main.platform, "system", return_value="Darwin"):
+            self.assertIn("Linux", main.dpi_install_support())
 
 
 class FirewallTests(unittest.TestCase):

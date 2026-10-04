@@ -139,9 +139,14 @@ function gpuDetails(status: Status | null, error: string) {
   return names.length ? names.join(" · ") : undefined;
 }
 
-type DpiStatus = { available: boolean; enabled: boolean; requested: boolean | null; busy: boolean; state: string; error: string | null };
+type DpiStatus = {
+  available: boolean; installed?: boolean; enabled: boolean; requested: boolean | null;
+  busy: boolean; state: string; error: string | null;
+  installing: boolean; can_install: boolean; install_error: string | null; install_hint: string | null;
+};
 const getDpiStatus = callable<[], DpiStatus>("get_dpi_status");
 const setDpiEnabled = callable<[boolean], DpiStatus>("set_dpi_enabled");
+const installDpiHelper = callable<[], DpiStatus>("install_dpi_helper");
 
 function DpiToggle() {
   const [status, setStatus] = useState<DpiStatus | null>(null);
@@ -173,7 +178,7 @@ function DpiToggle() {
     return () => { disposed = true; mounted.current = false; clearTimeout(timer); };
   }, []);
   const toggle = async (value: boolean) => {
-    if (busy.current || !status?.available || status.busy) return;
+    if (busy.current || !status?.available || status.busy || status.installing) return;
     busy.current = true;
     generation.current += 1;
     setPending(true);
@@ -188,12 +193,41 @@ function DpiToggle() {
       if (mounted.current) setPending(false);
     }
   };
-  return <PanelSectionRow>
+  const install = async () => {
+    if (busy.current || !status?.can_install) return;
+    busy.current = true;
+    generation.current += 1;
+    setPending(true);
+    setError("");
+    try {
+      const next = await installDpiHelper();
+      if (mounted.current) setStatus(next);
+    } catch (failure) {
+      if (mounted.current) setError(errorText(failure));
+    } finally {
+      busy.current = false;
+      if (mounted.current) setPending(false);
+    }
+  };
+  return <><PanelSectionRow>
     <ToggleField label="DPI bypass · Zapret2" checked={Boolean(status?.requested)}
-      disabled={pending || !status?.available || status.busy}
+      disabled={pending || !status?.available || status.busy || status.installing}
       description={pending ? "Applying…" : error || status?.error || (!status ? "Checking…" : status.enabled ? "Running · Restores ON after reboot" : "Off · Stays OFF after reboot")}
       bottomSeparator="none" onChange={value => { void toggle(value); }} />
-  </PanelSectionRow>;
+  </PanelSectionRow>
+    {(status?.installing || status?.installed === false) && <PanelSectionRow>
+      <ButtonItem layout="below" disabled={pending || !status.can_install}
+        description={status.install_error || status.install_hint || (status.installing
+          ? "Approve the Linux administrator prompt. Setup status updates automatically."
+          : "One-time setup. Linux may ask for administrator approval.")}
+        onClick={() => { void install(); }}>
+        {status.installing ? "Installing helper…" : "Install helper"}
+      </ButtonItem>
+    </PanelSectionRow>}
+    {status?.install_error && status.installed !== false && !status.installing && <PanelSectionRow>
+      <Field label="Helper setup" childrenLayout="below" bottomSeparator="none">{status.install_error}</Field>
+    </PanelSectionRow>}
+  </>;
 }
 
 function ToolsSection() {
