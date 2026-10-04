@@ -3,3 +3,4 @@ dist/
 __pycache__/
 *.zip
 AGENTS.md
+zapret2/runtime/

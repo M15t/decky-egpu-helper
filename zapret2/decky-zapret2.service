@@ -1,0 +1,27 @@
+[Unit]
+Description=Decky Zapret2 TCP DPI helper
+After=network.target
+ConditionPathExists=/var/lib/decky-zapret2/enabled
+
+[Service]
+Type=exec
+ExecStartPre=/usr/bin/python3 -I /opt/decky-zapret2/firewall.py start
+ExecStart=/opt/decky-zapret2/nfqws2 --qnum=28745 --fwmark=0x40000000 --user=nobody --lua-init=@/opt/decky-zapret2/zapret-lib.lua --lua-init=@/opt/decky-zapret2/zapret-antidpi.lua --filter-tcp=80 --filter-l7=http --payload=http_req --lua-desync=multisplit:pos=method+2 --new --filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=multisplit:pos=2
+ExecStopPost=/usr/bin/python3 -I /opt/decky-zapret2/firewall.py stop
+TimeoutStartSec=15
+TimeoutStopSec=15
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_SETPCAP
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

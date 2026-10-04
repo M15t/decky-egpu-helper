@@ -139,6 +139,63 @@ function gpuDetails(status: Status | null, error: string) {
   return names.length ? names.join(" · ") : undefined;
 }
 
+type DpiStatus = { available: boolean; enabled: boolean; requested: boolean | null; busy: boolean; state: string; error: string | null };
+const getDpiStatus = callable<[], DpiStatus>("get_dpi_status");
+const setDpiEnabled = callable<[boolean], DpiStatus>("set_dpi_enabled");
+
+function DpiToggle() {
+  const [status, setStatus] = useState<DpiStatus | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  const busy = useRef(false);
+  const generation = useRef(0);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      const revision = generation.current;
+      if (!busy.current) {
+        try {
+          const next = await getDpiStatus();
+          if (!disposed && revision === generation.current) { setStatus(next); setError(""); }
+        } catch (failure) {
+          if (!disposed && revision === generation.current) {
+            setStatus(null);
+            setError(errorText(failure));
+          }
+        }
+      }
+      if (!disposed) timer = setTimeout(refresh, 4000);
+    };
+    void refresh();
+    return () => { disposed = true; mounted.current = false; clearTimeout(timer); };
+  }, []);
+  const toggle = async (value: boolean) => {
+    if (busy.current || !status?.available || status.busy) return;
+    busy.current = true;
+    generation.current += 1;
+    setPending(true);
+    setError("");
+    try {
+      const next = await setDpiEnabled(value);
+      if (mounted.current) { setStatus(next); setError(next.error ?? ""); }
+    } catch (failure) {
+      if (mounted.current) { setStatus(null); setError(errorText(failure)); }
+    } finally {
+      busy.current = false;
+      if (mounted.current) setPending(false);
+    }
+  };
+  return <PanelSectionRow>
+    <ToggleField label="DPI bypass · Zapret2" checked={Boolean(status?.requested)}
+      disabled={pending || !status?.available || status.busy}
+      description={pending ? "Applying…" : error || status?.error || (!status ? "Checking…" : status.enabled ? "Running · Restores ON after reboot" : "Off · Stays OFF after reboot")}
+      bottomSeparator="none" onChange={value => { void toggle(value); }} />
+  </PanelSectionRow>;
+}
+
 function ToolsSection() {
   const [backlight, setBacklight] = useState<BacklightStatus | null>(null);
   const pending = useRef(false);
@@ -187,6 +244,7 @@ function ToolsSection() {
 
   return (
     <PanelSection title="Tools">
+      <DpiToggle />
       <PanelSectionRow>
         <ToggleField
           label="Force off internal backlight"

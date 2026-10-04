@@ -437,8 +437,60 @@ async def pci_scan():
     return {"ran": False, "error": error, "output": ""}
 
 
+DPI_SERVICE = "decky-zapret2.service"
+DPI_ENABLED_FILE = Path("/var/lib/decky-zapret2/enabled")
+
+
+async def dpi_systemctl(operation):
+    if operation not in ("show", "start", "stop"):
+        raise ValueError("Unsupported DPI operation")
+    if os.geteuid() == 0:
+        raise RuntimeError("Decky plugin must run as the Decky user")
+    args = ["/usr/bin/systemctl", "--system", "--no-ask-password", operation, DPI_SERVICE]
+    if operation == "show":
+        args.append("--property=LoadState,ActiveState,SubState,Result,MainPID")
+    process = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=25)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.communicate()
+        raise
+    if process.returncode:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or "DPI service command failed")
+    return stdout.decode(errors="replace")
+
+
+async def dpi_status():
+    try:
+        fields = dict(line.split("=", 1) for line in (await dpi_systemctl("show")).splitlines() if "=" in line)
+        available = fields.get("LoadState") == "loaded"
+        state = fields.get("ActiveState", "unknown")
+        enabled = available and state == "active" and fields.get("SubState") == "running" and int(fields.get("MainPID", "0")) > 0
+        error = None if available else "Install the Zapret2 helper first (see README)."
+        if state == "failed":
+            error = "Zapret2 failed: " + fields.get("Result", "unknown")
+        requested = DPI_ENABLED_FILE.exists()
+        if not DPI_ENABLED_FILE.parent.is_dir():
+            available = False
+            error = "Install or update the Zapret2 helper to save its ON/OFF setting."
+        busy = state in ("activating", "deactivating", "reloading")
+        if available and not busy and requested != enabled and not error:
+            error = "Saved ON, but service is not running." if requested else "Saved OFF, but service is still running."
+        return {"available": available, "enabled": enabled, "requested": requested, "busy": busy, "state": state, "error": error}
+    except Exception as error:
+        return {"available": False, "enabled": False, "requested": None, "busy": False, "state": "unknown", "error": str(error) or type(error).__name__}
+
+
 class Plugin:
     def __init__(self):
+        self._dpi_lock = asyncio.Lock()
         self._restart_lock = asyncio.Lock()
         self._cooldown_until = 0.0
         self._lspci_names = {}
@@ -446,6 +498,39 @@ class Plugin:
         self._backlight_lock = asyncio.Lock()
         self._backlight_task = None
         self._settings = load_settings()
+
+    async def get_dpi_status(self):
+        async with self._dpi_lock:
+            return await dpi_status()
+
+    async def set_dpi_enabled(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        async with self._dpi_lock:
+            try:
+                # Save intent before changing runtime state. Shutdown stops the
+                # service without changing this marker, so boot can restore ON.
+                if not DPI_ENABLED_FILE.parent.is_dir():
+                    raise RuntimeError("Install or update the Zapret2 helper first.")
+                if enabled:
+                    # Never follow a symlink or truncate an existing file.
+                    try:
+                        with DPI_ENABLED_FILE.open("x"):
+                            pass
+                    except FileExistsError:
+                        if not DPI_ENABLED_FILE.is_file() or DPI_ENABLED_FILE.is_symlink():
+                            raise RuntimeError("Invalid Zapret2 preference file")
+                else:
+                    DPI_ENABLED_FILE.unlink(missing_ok=True)
+                await dpi_systemctl("start" if enabled else "stop")
+            except Exception as error:
+                status = await dpi_status()
+                status["error"] = str(error) or type(error).__name__
+                return status
+            status = await dpi_status()
+            if status["enabled"] != enabled and not status["error"]:
+                status["error"] = "Service did not reach the requested state; check its journal."
+            return status
 
     async def lspci_names(self):
         if self._lspci_names and time.monotonic() - self._lspci_at < 5:
