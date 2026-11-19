@@ -5,6 +5,7 @@ import { BsGpuCard } from "react-icons/bs";
 
 type Status = {
   devices: { address: string; driver: string | null; name: string | null }[];
+  egpu_display: boolean;
   service: Record<string, string>;
   target: Record<string, string>;
   marker: boolean;
@@ -16,8 +17,7 @@ type BoltStatus = {
   available: boolean;
   devices: { id: string; name: string; status: string; link: string | null; power: string | null; generation?: string | null }[];
   error: string | null;
-  gpu_on_pci?: boolean | null;
-  gpu_ready?: boolean | null;
+  usb_fallback?: boolean;
   pci_scan?: { ran: boolean; error: string | null } | null;
 };
 
@@ -31,17 +31,30 @@ type BacklightStatus = {
   error: string | null;
 };
 
+type InstallState = "current" | "outdated" | "missing" | "foreign";
+type AutofixStatus = { state: InstallState; enabled: boolean };
+type SleepHookStatus = { state: InstallState | null; enabled: boolean; keep_dock: boolean; busy: boolean; error: string | null; can_change: boolean };
+type AutoSwitchStatus = { enabled: boolean; waiting: boolean };
+
 const getStatus = callable<[], Status>("get_status");
 const getBoltStatus = callable<[], BoltStatus>("get_bolt_status");
 const getBacklightStatus = callable<[], BacklightStatus>("get_backlight_status");
 const setBacklightOff = callable<[boolean], BacklightStatus>("set_backlight_off");
 const restartGamescope = callable<[], { message: string }>("restart_gamescope");
+const getAutofixStatus = callable<[], AutofixStatus>("get_autofix_status");
+const installAutofix = callable<[], AutofixStatus>("install_autofix");
+const removeAutofix = callable<[], AutofixStatus>("remove_autofix");
+const getSleepHookStatus = callable<[], SleepHookStatus>("get_sleep_hook_status");
+const setSleepHook = callable<[boolean], SleepHookStatus>("set_sleep_hook");
+const setKeepDock = callable<[boolean], SleepHookStatus>("set_keep_dock");
+const getAutoSwitch = callable<[], AutoSwitchStatus>("get_auto_switch");
+const setAutoSwitch = callable<[boolean], AutoSwitchStatus>("set_auto_switch");
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
-const joinMeta = (...parts: Array<string | null | undefined>) => parts.filter(Boolean).join(" · ");
+const joinMeta = (...parts: Array<string | null | undefined | false>) => parts.filter(Boolean).join(" · ");
 
 const boltLabels: Record<string, string> = {
-  authorized: "Authorized",
-  connected: "Connected",
+  authorized: "USB4",
+  connected: "Connected, not authorized",
   disconnected: "Disconnected",
   connecting: "Connecting",
   authorizing: "Authorizing",
@@ -49,94 +62,271 @@ const boltLabels: Record<string, string> = {
   unknown: "Unknown",
 };
 
-function BoltSection() {
-  const [bolt, setBolt] = useState<BoltStatus | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const refreshNow = useRef<() => void>(() => {});
-  useEffect(() => {
-    let disposed = false;
-    let fetching = false;
-    const refresh = async () => {
-      if (disposed || fetching) return;
-      fetching = true;
-      setRefreshing(true);
-      try {
-        const next = await getBoltStatus();
-        if (!disposed) setBolt(next);
-      } catch (failure) {
-        if (!disposed) setBolt({ available: false, devices: [], error: errorText(failure), gpu_on_pci: null, gpu_ready: null });
-      } finally {
-        fetching = false;
-        if (!disposed) setRefreshing(false);
-      }
-    };
-    refreshNow.current = () => { void refresh(); };
-    void refresh();
-    return () => {
-      disposed = true;
-      refreshNow.current = () => {};
-    };
-  }, []);
-
-  const summary = !bolt
-    ? "Checking boltctl…"
-    : !bolt.available
-      ? (bolt.error ?? "Unknown error")
-      : !bolt.devices.length
-        ? "No devices listed by boltctl"
-        : null;
-
-  return (
-    <PanelSection title="Connection">
-      {summary && !bolt?.devices.length && (
-        <PanelSectionRow>
-          <Field
-            label={bolt && !bolt.available ? "Unavailable" : "Connection"}
-            childrenLayout="below"
-            bottomSeparator="none"
-          >
-            {summary}
-          </Field>
-        </PanelSectionRow>
-      )}
-      {bolt?.devices.map(device => (
-        <PanelSectionRow key={device.id}>
-          <Field
-            label={boltLabels[device.status] ?? device.status}
-            childrenLayout="below"
-            bottomSeparator="none"
-          >
-            {joinMeta(device.name, device.generation, device.link, device.power && `Power ${device.power}`)}
-          </Field>
-        </PanelSectionRow>
-      ))}
-      {bolt?.pci_scan?.error && (
-        <PanelSectionRow>
-          <Field label="PCI scan" childrenLayout="below" bottomSeparator="none">
-            {bolt.pci_scan.error}
-          </Field>
-        </PanelSectionRow>
-      )}
-      <PanelSectionRow>
-        <ButtonItem layout="below" disabled={refreshing} onClick={() => refreshNow.current()}>
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </ButtonItem>
-      </PanelSectionRow>
-    </PanelSection>
-  );
-}
-
-function gpuHeadline(status: Status | null, error: string) {
+function headline(status: Status | null, error: string) {
   if (!status) return error ? "Status unavailable" : "Checking…";
-  if (status.devices.some(device => device.driver === "amdgpu")) return "GPU ready";
+  const ready = status.devices.find(device => device.driver === "amdgpu");
+  if (ready) return `● ${ready.name ?? "eGPU"} ready`;
   if (status.devices.length) return "On PCI · Driver not ready";
   return "GPU not on PCI";
 }
 
-function gpuDetails(status: Status | null, error: string) {
-  if (!status) return error || undefined;
-  const names = status.devices.map(device => device.name).filter(Boolean);
-  return names.length ? names.join(" · ") : undefined;
+function dockLine(bolt: BoltStatus | null) {
+  if (!bolt) return "Checking dock…";
+  if (!bolt.available) return bolt.error ?? "boltctl unavailable";
+  const dock = bolt.devices[0];
+  if (!dock) return "No dock listed by boltctl";
+  return joinMeta(dock.name, boltLabels[dock.status] ?? dock.status, dock.status === "authorized" && dock.link);
+}
+
+function StatusSection({ tick }: { tick: number }) {
+  const [status, setStatus] = useState<Status | null>(null);
+  const [bolt, setBolt] = useState<BoltStatus | null>(null);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [running, setRunning] = useState(false);
+  const requestPending = useRef(false);
+  const boltRequest = useRef(0);
+
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const next = await getStatus();
+        if (!disposed) { setStatus(next); setError(""); }
+      } catch (failure) {
+        if (!disposed) { setStatus(null); setError(errorText(failure)); }
+      } finally {
+        if (!disposed) timer = setTimeout(refresh, 2000);
+      }
+    };
+    void refresh();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, []);
+
+  useEffect(() => {
+    // Only the newest request may update the dock line.
+    const request = ++boltRequest.current;
+    setBolt(null);
+    getBoltStatus().then(
+      next => { if (request === boltRequest.current) setBolt(next); },
+      failure => { if (request === boltRequest.current) setBolt({ available: false, devices: [], error: errorText(failure) }); },
+    );
+  }, [tick]);
+
+  const restart = async () => {
+    if (requestPending.current) return;
+    requestPending.current = true;
+    setRunning(true);
+    setMessage("Requesting restart… Steam may disconnect.");
+    try {
+      setMessage((await restartGamescope()).message);
+    } catch (failure) {
+      setMessage(`Could not confirm restart: ${errorText(failure)}. Check the session before retrying.`);
+    } finally {
+      requestPending.current = false;
+      setRunning(false);
+    }
+  };
+
+  const ready = Boolean(status?.devices.some(device => device.driver === "amdgpu"));
+  const hint = bolt?.usb_fallback
+    ? "Dock is in USB fallback. Press the TB5 button on the dock."
+    : bolt?.pci_scan?.error ?? (error && status ? error : null);
+
+  return (
+    <PanelSection title="Status">
+      <PanelSectionRow>
+        <Field label={headline(status, error)} childrenLayout="below" bottomSeparator="none">
+          <div>{dockLine(bolt)}</div>
+          {ready && <div>{status?.egpu_display ? "Display: eGPU" : "Display: built-in GPU"}</div>}
+          {hint && <div>{hint}</div>}
+          {!status && error && <div>{error}</div>}
+        </Field>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={running || status?.busy === true}
+          onClick={() => showModal(
+            <ConfirmModal
+              strTitle="Restart Gamescope?"
+              strDescription="This may close your game and restart Steam. Save first."
+              strOKButtonText="Restart"
+              strCancelButtonText="Cancel"
+              bDestructiveWarning
+              onOK={() => { void restart(); }}
+            />,
+          )}
+        >
+          {running || status?.busy ? "Restart requested…" : ready && !status?.egpu_display ? "Restart to use eGPU" : "Restart Gamescope"}
+        </ButtonItem>
+      </PanelSectionRow>
+      {message && (
+        <PanelSectionRow>
+          <Field childrenLayout="below" bottomSeparator="none">{message}</Field>
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+  );
+}
+
+function installDescription(state: InstallState | null, foreign: string, normal: string) {
+  if (state === "foreign") return foreign;
+  if (state === "outdated") return "Update available. Turn on to update.";
+  return normal;
+}
+
+function AutofixToggle({ tick }: { tick: number }) {
+  const [status, setStatus] = useState<AutofixStatus | null>(null);
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  useEffect(() => {
+    getAutofixStatus().then(next => { setStatus(next); setError(""); }, failure => setError(errorText(failure)));
+  }, [tick]);
+  const change = async (on: boolean) => {
+    setPending(true);
+    setError("");
+    try {
+      setStatus(await (on ? installAutofix() : removeAutofix()));
+    } catch (failure) {
+      setError(errorText(failure));
+      // A failed systemctl call can follow a successful file write.
+      await getAutofixStatus().then(setStatus, () => setStatus(null));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <PanelSectionRow>
+      <ToggleField
+        label="Auto-fix at boot"
+        checked={status?.state === "current" && status.enabled}
+        disabled={pending || !status}
+        description={pending ? "Applying…" : error || (!status ? "Checking…" : installDescription(
+          status.state,
+          "Hand-installed copy found. Turning on replaces it and keeps a .bak.",
+          "Restarts Gamescope once at login when the eGPU is on PCI.",
+        ))}
+        bottomSeparator="none"
+        onChange={on => { void change(on); }}
+      />
+    </PanelSectionRow>
+  );
+}
+
+function SleepHookToggle({ tick }: { tick: number }) {
+  const [status, setStatus] = useState<SleepHookStatus | null>(null);
+  const [error, setError] = useState("");
+  const [requested, setRequested] = useState<boolean | null>(null);
+  const [requestedKeep, setRequestedKeep] = useState<boolean | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const next = await getSleepHookStatus();
+        if (disposed) return;
+        setStatus(next);
+        setError("");
+        if (next.busy) timer = setTimeout(refresh, 2000);
+        else { setRequested(null); setRequestedKeep(null); }
+      } catch (failure) {
+        if (!disposed) setError(errorText(failure));
+      }
+    };
+    void refresh();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [tick, requested, requestedKeep]);
+  const change = async (on: boolean) => {
+    setError("");
+    try {
+      setStatus(await setSleepHook(on));
+      setRequested(on);
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  };
+  const changeKeep = async (on: boolean) => {
+    setError("");
+    try {
+      setStatus(await setKeepDock(on));
+      setRequestedKeep(on);
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  };
+  const installed = status?.state === "current" && status.enabled;
+  return (
+    <>
+    <PanelSectionRow>
+      <ToggleField
+        label="Sleep hook"
+        checked={requested ?? installed}
+        disabled={!status?.can_change}
+        description={status?.busy ? "Approve the administrator prompt…" : error || status?.error || (!status ? "Checking…" : installDescription(
+          status.state,
+          "Hand-installed hook found. Turning on replaces it and keeps a .bak.",
+          "Detaches the eGPU before sleep so the Ally can wake, and keeps the USB4 link awake. Press TB5 on the dock after waking, unless Keep dock linked is on.",
+        ))}
+        bottomSeparator={installed ? "standard" : "none"}
+        onChange={on => { void change(on); }}
+      />
+    </PanelSectionRow>
+    {installed && (
+      <PanelSectionRow>
+        <ToggleField
+          label="Keep dock linked during sleep"
+          checked={requestedKeep ?? status.keep_dock}
+          disabled={!status.can_change}
+          description={status.busy ? "Approve the administrator prompt…" : "Experimental. While a dock is attached, the Ally sleeps lightly so the dock comes back without TB5. The eGPU's fans keep spinning during sleep. One test sleep crashed and rebooted the Ally."}
+          bottomSeparator="none"
+          onChange={on => { void changeKeep(on); }}
+        />
+      </PanelSectionRow>
+    )}
+    </>
+  );
+}
+
+function AutoSwitchToggle({ tick }: { tick: number }) {
+  const [status, setStatus] = useState<AutoSwitchStatus | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    getAutoSwitch().then(next => { setStatus(next); setError(""); }, failure => setError(errorText(failure)));
+  }, [tick]);
+  const change = async (on: boolean) => {
+    setError("");
+    try {
+      setStatus(await setAutoSwitch(on));
+    } catch (failure) {
+      setError(errorText(failure));
+    }
+  };
+  return (
+    <PanelSectionRow>
+      <ToggleField
+        label="Auto-switch to eGPU"
+        checked={Boolean(status?.enabled)}
+        disabled={!status}
+        description={error || (status?.waiting
+          ? "eGPU is up. Switching after the running game exits."
+          : "Restarts Gamescope once when the eGPU comes up, such as after pressing TB5. Waits for a running game to exit.")}
+        bottomSeparator="none"
+        onChange={on => { void change(on); }}
+      />
+    </PanelSectionRow>
+  );
+}
+
+function SetupSection({ tick }: { tick: number }) {
+  return (
+    <PanelSection title="Setup">
+      <AutofixToggle tick={tick} />
+      <AutoSwitchToggle tick={tick} />
+      <SleepHookToggle tick={tick} />
+    </PanelSection>
+  );
 }
 
 type DpiStatus = {
@@ -230,7 +420,7 @@ function DpiToggle() {
   </>;
 }
 
-function ToolsSection() {
+function ToolsSection({ onRefresh }: { onRefresh: () => void }) {
   const [backlight, setBacklight] = useState<BacklightStatus | null>(null);
   const pending = useRef(false);
 
@@ -238,15 +428,7 @@ function ToolsSection() {
     try {
       setBacklight(await getBacklightStatus());
     } catch (failure) {
-      setBacklight({
-        available: false,
-        off: false,
-        brightness: null,
-        max: null,
-        saved: null,
-        node: null,
-        error: errorText(failure),
-      });
+      setBacklight({ available: false, off: false, brightness: null, max: null, saved: null, node: null, error: errorText(failure) });
     }
   };
 
@@ -288,101 +470,20 @@ function ToolsSection() {
           onChange={(value) => { void toggle(value); }}
         />
       </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={onRefresh}>Refresh</ButtonItem>
+      </PanelSectionRow>
     </PanelSection>
   );
 }
 
 function Content() {
-  const [status, setStatus] = useState<Status | null>(null);
-  const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
-  const [running, setRunning] = useState(false);
-  const requestPending = useRef(false);
-
-  useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = async () => {
-      try {
-        const next = await getStatus();
-        if (!disposed) {
-          setStatus(next);
-          setError("");
-        }
-      } catch (failure) {
-        if (!disposed) {
-          setStatus(null);
-          setError(errorText(failure));
-        }
-      } finally {
-        if (!disposed) timer = setTimeout(refresh, 2000);
-      }
-    };
-    void refresh();
-    return () => { disposed = true; clearTimeout(timer); };
-  }, []);
-
-  const restart = async () => {
-    if (requestPending.current) return;
-    requestPending.current = true;
-    setRunning(true);
-    setMessage("Requesting restart… Steam may disconnect.");
-    try {
-      const result = await restartGamescope();
-      setMessage(result.message);
-    } catch (failure) {
-      setMessage(`Could not confirm restart: ${errorText(failure)}. Check the session before retrying.`);
-    } finally {
-      requestPending.current = false;
-      setRunning(false);
-    }
-  };
-
+  const [tick, setTick] = useState(0);
   return (
     <>
-      <BoltSection />
-      <PanelSection title="eGPU">
-        <PanelSectionRow>
-          <Field
-            label={gpuHeadline(status, error)}
-            childrenLayout="below"
-            bottomSeparator="none"
-          >
-            {gpuDetails(status, error)}
-          </Field>
-        </PanelSectionRow>
-        {error && status && (
-          <PanelSectionRow>
-            <Field label="Status unavailable" childrenLayout="below" bottomSeparator="none">
-              {error}
-            </Field>
-          </PanelSectionRow>
-        )}
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={running || status?.busy === true}
-            onClick={() => showModal(
-              <ConfirmModal
-                strTitle="Restart Gamescope?"
-                strDescription="This may close your game and restart Steam. Save first."
-                strOKButtonText="Restart"
-                strCancelButtonText="Cancel"
-                bDestructiveWarning
-                onOK={() => { void restart(); }}
-              />,
-            )}
-          >
-            {running || status?.busy ? "Restart requested…" : "Restart"}
-          </ButtonItem>
-        </PanelSectionRow>
-        {message && (
-          <PanelSectionRow>
-            <Field childrenLayout="below" bottomSeparator="none">{message}</Field>
-          </PanelSectionRow>
-        )}
-      </PanelSection>
-      <ToolsSection />
+      <StatusSection tick={tick} />
+      <SetupSection tick={tick} />
+      <ToolsSection onRefresh={() => setTick(value => value + 1)} />
     </>
   );
 }

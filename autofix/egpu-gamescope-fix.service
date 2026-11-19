@@ -1,0 +1,10 @@
+# Managed by eGPU Helper. Edits are overwritten when the plugin updates.
+[Unit]
+Description=Restart Gamescope once when eGPU is detected
+After=default.target
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/egpu-gamescope-fix.sh
+TimeoutStartSec=30
+[Install]
+WantedBy=default.target

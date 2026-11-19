@@ -1,0 +1,14 @@
+# Managed by eGPU Helper. Edits are overwritten when the plugin updates.
+[Unit]
+Description=Detach eGPU before sleep and rescan PCI after wake
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/etc/egpu-sleep/egpu-sleep.sh pre
+ExecStop=/etc/egpu-sleep/egpu-sleep.sh post
+
+[Install]
+WantedBy=sleep.target

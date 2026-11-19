@@ -10,11 +10,18 @@ import time
 
 PCI_DEVICES = Path("/sys/bus/pci/devices")
 BACKLIGHT = Path("/sys/class/backlight")
-GPU_ID = ("0x1002", "0x73ff")
+AMD_VENDOR = "1002"
+# RX 6600 (Navi 23) and RX 9070 / 9070 XT (Navi 48).
+EGPU_DEVICES = ("73ff", "7550")
 SERVICE = "egpu-gamescope-fix.service"
 TARGET = "gamescope-session.target"
 SETTINGS_FILE = "settings.json"
 BACKLIGHT_POLL_SEC = 2
+AUTO_SWITCH_POLL_SEC = 2
+# Matches the auto-fix script's wait for amdgpu/DRM to finish after the driver binds.
+AUTO_SWITCH_SETTLE_SEC = 3
+# The auto-fix touches its marker just before restarting; an arrival this soon after is its boot restart.
+AUTOFIX_GRACE_SEC = 30
 RADEON_BRACKET = re.compile(r"\[([^\]]*Radeon[^\]]*)\]", re.IGNORECASE)
 
 
@@ -47,7 +54,7 @@ def gpu_label(device):
 
 LSPCI_GPU = re.compile(
     r"^(?:([0-9a-f:.]+)\s+)?(?:VGA compatible controller|3D controller|Display controller)"
-    r"\s+\[[0-9a-f]+\]:\s+(.+?)\s+\[1002:73ff\]",
+    rf"\s+\[[0-9a-f]+\]:\s+(.+?)\s+\[{AMD_VENDOR}:(?:{'|'.join(EGPU_DEVICES)})\]",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -63,7 +70,7 @@ def parse_lspci_names(output):
             names[address] = short
             if ":" in address:
                 names[address.split(":", 1)[1]] = short
-        names["1002:73ff"] = short
+        names["egpu"] = short
     return names
 
 
@@ -98,7 +105,7 @@ def apply_lspci_names(devices, output):
         device["name"] = (
             names.get(address)
             or names.get(address.split(":", 1)[-1])
-            or names.get("1002:73ff")
+            or names.get("egpu")
         )
     return devices
 
@@ -110,11 +117,14 @@ def gpu_status():
         try:
             vendor = (device / "vendor").read_text().strip().lower()
             product = (device / "device").read_text().strip().lower()
-            if (vendor, product) != GPU_ID:
+            if not is_egpu_id(vendor, product):
                 continue
             driver = device / "driver"
             devices.append({
                 "address": device.name,
+                # Removing and adding the device back, as the sleep hook does,
+                # gives it a new sysfs node.
+                "node": device.stat().st_ino,
                 "driver": driver.resolve().name if driver.exists() else None,
                 "name": gpu_label(device),
             })
@@ -122,6 +132,58 @@ def gpu_status():
             # Hot-unplug can remove a device between reads.
             continue
     return devices
+
+
+def drives_display(address):
+    # An enabled connector shows scanout on this GPU, not where games render.
+    for card in (PCI_DEVICES / address / "drm").glob("card*"):
+        for connector in card.glob(f"{card.name}-*"):
+            try:
+                if (connector / "enabled").read_text().strip() == "enabled":
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def autofix_marker():
+    return Path(f"/run/user/{os.geteuid()}/egpu-gamescope-restarted")
+
+
+def autofix_restarted_recently():
+    try:
+        return time.time() - autofix_marker().stat().st_mtime < AUTOFIX_GRACE_SEC
+    except FileNotFoundError:
+        return False
+
+
+def game_running(proc=Path("/proc")):
+    # Steam starts every game, non-Steam shortcuts included, through "reaper SteamLaunch".
+    for cmdline in proc.glob("[0-9]*/cmdline"):
+        try:
+            if b"SteamLaunch" in cmdline.read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+USB_DEVICES = Path("/sys/bus/usb/devices")
+
+
+def usb_dock_present():
+    # Without a USB4 link, a TB5 dock still enumerates its USB2 hub controller.
+    for product in USB_DEVICES.glob("*/product"):
+        try:
+            if "TBT" in product.read_text():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def is_egpu_id(vendor, product):
+    return vendor == f"0x{AMD_VENDOR}" and product.removeprefix("0x") in EGPU_DEVICES
 
 
 def sys_int(path):
@@ -148,7 +210,8 @@ def pci_ids_for(path):
 
 
 def is_egpu_backlight(node):
-    return pci_ids_for(node) == GPU_ID
+    ids = pci_ids_for(node)
+    return ids is not None and is_egpu_id(*ids)
 
 
 def internal_backlight_node():
@@ -206,6 +269,7 @@ def load_settings():
     return {
         "backlight_off": bool(data.get("backlight_off", False)),
         "saved_brightness": saved if saved and saved > 0 else None,
+        "auto_switch": bool(data.get("auto_switch", False)),
     }
 
 
@@ -214,6 +278,7 @@ def save_settings(settings):
     settings_path().write_text(json.dumps({
         "backlight_off": bool(settings.get("backlight_off")),
         "saved_brightness": settings.get("saved_brightness"),
+        "auto_switch": bool(settings.get("auto_switch")),
     }))
 
 
@@ -304,7 +369,7 @@ async def systemctl(*args):
 
 async def unit_status(unit):
     output = await systemctl(
-        "show", unit, "--property=LoadState,ActiveState,SubState,Result",
+        "show", unit, "--property=LoadState,ActiveState,SubState,Result,UnitFileState",
     )
     return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
 
@@ -439,6 +504,104 @@ async def pci_scan():
     return {"ran": False, "error": error, "output": ""}
 
 
+AUTOFIX_DIR = Path(__file__).resolve().parent / "autofix"
+MANAGED = "# Managed by eGPU Helper."
+
+
+def autofix_files(home):
+    script = (AUTOFIX_DIR / "egpu-gamescope-fix.sh").read_text().replace(
+        "@EGPU_ID@", f"{AMD_VENDOR}:({'|'.join(EGPU_DEVICES)})",
+    )
+    return [
+        (home / ".local/bin/egpu-gamescope-fix.sh", script, 0o755),
+        (home / ".config/systemd/user" / SERVICE, (AUTOFIX_DIR / SERVICE).read_text(), 0o644),
+    ]
+
+
+def managed_state(files):
+    texts = [path.read_text() if path.is_file() else None for path, _, _ in files]
+    if any(text is not None and MANAGED not in text for text in texts):
+        return "foreign"
+    if None in texts:
+        return "missing"
+    if all(text == content for text, (_, content, _) in zip(texts, files)):
+        return "current"
+    return "outdated"
+
+
+def write_managed(files):
+    for path, content, mode in files:
+        if path.is_file():
+            current = path.read_text()
+            if current == content:
+                continue
+            backup = path.with_name(path.name + ".bak")
+            # Keep the first backup: it is the hand-installed original.
+            if MANAGED not in current and not backup.exists():
+                backup.write_text(current)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(path.name + ".tmp")
+        staged.write_text(content)
+        staged.chmod(mode)
+        os.replace(staged, path)
+
+
+def remove_managed(files):
+    for path, _, _ in files:
+        if path.is_file() and MANAGED in path.read_text():
+            path.unlink()
+
+
+SLEEP_HOOK_DIR = Path(__file__).resolve().parent / "sleephook"
+SLEEP_SERVICE = "egpu-sleep.service"
+SLEEP_RULE = "90-egpu-helper.rules"
+# Lives next to the installed sleep hook script while Keep dock linked is on.
+KEEP_DOCK_NAME = "keep-dock"
+
+
+def sleep_hook_files(root=Path("/")):
+    script = (SLEEP_HOOK_DIR / "egpu-sleep.sh").read_text().replace(
+        "@EGPU_ID@", f"^0x{AMD_VENDOR}:0x({'|'.join(EGPU_DEVICES)})$",
+    )
+    return [
+        (root / "etc/egpu-sleep/egpu-sleep.sh", script, 0o755),
+        (root / "etc/systemd/system" / SLEEP_SERVICE, (SLEEP_HOOK_DIR / SLEEP_SERVICE).read_text(), 0o644),
+        (root / "etc/udev/rules.d" / SLEEP_RULE, (SLEEP_HOOK_DIR / SLEEP_RULE).read_text(), 0o644),
+    ]
+
+
+def sleep_hook_state():
+    files = sleep_hook_files()
+    return managed_state(files), files[0][0].with_name(KEEP_DOCK_NAME).exists()
+
+
+async def system_unit_enabled(unit):
+    process = await asyncio.create_subprocess_exec(
+        "/usr/bin/systemctl", "--system", "show", unit, "--property=UnitFileState",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    stdout, _ = await asyncio.wait_for(process.communicate(), timeout=8)
+    return stdout.decode(errors="replace").strip() == "UnitFileState=enabled"
+
+
+async def pkexec_python(script, *args):
+    process = await asyncio.create_subprocess_exec(
+        str(PKEXEC), "--disable-internal-agent", "/usr/bin/python3", "-E", "-s", str(script), *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, cwd="/",
+    )
+    # Never kill an authorized root process mid-write.
+    _, stderr = await process.communicate()
+    if process.returncode == 126:
+        raise RuntimeError("Cancelled. You can try again.")
+    if process.returncode == 127:
+        raise RuntimeError("Administrator authorization failed or no prompt is available. Try Desktop Mode or the README terminal setup.")
+    if process.returncode:
+        raise RuntimeError(stderr.decode(errors="replace").strip()[-2000:] or "Sleep hook setup failed.")
+
+
 DPI_SERVICE = "decky-zapret2.service"
 DPI_ENABLED_FILE = Path("/var/lib/decky-zapret2/enabled")
 DPI_INSTALLER = Path(__file__).resolve().parent / "zapret2/install.py"
@@ -511,12 +674,20 @@ class Plugin:
         self._dpi_install_task = None
         self._dpi_install_error = None
         self._restart_lock = asyncio.Lock()
+        self._autofix_lock = asyncio.Lock()
+        self._sleep_task = None
+        self._sleep_error = None
+        self._home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
         self._cooldown_until = 0.0
         self._lspci_names = {}
         self._lspci_at = 0.0
         self._backlight_lock = asyncio.Lock()
         self._backlight_task = None
         self._settings = load_settings()
+        # None until the first poll, so a GPU already up when the plugin loads is no arrival.
+        self._egpu_ready = None
+        self._switch_due = None
+        self._switch_task = None
 
     async def get_dpi_status(self):
         async with self._dpi_lock:
@@ -631,7 +802,7 @@ class Plugin:
                 device["name"] = (
                     names.get(address)
                     or names.get(address.split(":", 1)[-1])
-                    or names.get("1002:73ff")
+                    or names.get("egpu")
                 )
         return devices
 
@@ -646,6 +817,8 @@ class Plugin:
                 self._lspci_at = time.monotonic()
         else:
             result["pci_scan"] = None
+        authorized = any(device["status"] == "authorized" for device in result["devices"])
+        result["usb_fallback"] = not authorized and await asyncio.to_thread(usb_dock_present)
         try:
             gpus = await self.named_gpus()
             result["gpu_on_pci"] = bool(gpus)
@@ -665,13 +838,15 @@ class Plugin:
             and service.get("ActiveState") not in ("activating", "deactivating")
             and not busy
         )
+        display = await asyncio.to_thread(
+            lambda: any(drives_display(device["address"]) for device in devices),
+        )
         return {
             "devices": devices,
+            "egpu_display": display,
             "service": service,
             "target": target,
-            "marker": Path(
-                f"/run/user/{os.geteuid()}/egpu-gamescope-restarted"
-            ).exists(),
+            "marker": autofix_marker().exists(),
             "busy": busy,
             "can_restart": ready,
         }
@@ -692,6 +867,78 @@ class Plugin:
             self._cooldown_until = time.monotonic() + 15
             return {"message": "Restart queued. Steam may disconnect while Gamescope restarts."}
 
+    async def _autofix_status(self):
+        state = await asyncio.to_thread(lambda: managed_state(autofix_files(self._home)))
+        unit = await unit_status(SERVICE)
+        return {"state": state, "enabled": unit.get("UnitFileState") == "enabled"}
+
+    async def get_autofix_status(self):
+        async with self._autofix_lock:
+            return await self._autofix_status()
+
+    async def install_autofix(self):
+        async with self._autofix_lock:
+            await asyncio.to_thread(lambda: write_managed(autofix_files(self._home)))
+            await systemctl("daemon-reload")
+            # Enable only. Starting the unit would restart Gamescope now.
+            await systemctl("enable", SERVICE)
+            return await self._autofix_status()
+
+    async def remove_autofix(self):
+        async with self._autofix_lock:
+            files = await asyncio.to_thread(autofix_files, self._home)
+            if await asyncio.to_thread(managed_state, files) == "foreign":
+                raise RuntimeError("The installed auto-fix was not made by this plugin. Install it first.")
+            if (await unit_status(SERVICE)).get("LoadState") == "loaded":
+                await systemctl("disable", SERVICE)
+            await asyncio.to_thread(remove_managed, files)
+            await systemctl("daemon-reload")
+            return await self._autofix_status()
+
+    async def get_sleep_hook_status(self):
+        error = self._sleep_error
+        try:
+            state, keep_dock = await asyncio.to_thread(sleep_hook_state)
+            enabled = await system_unit_enabled(SLEEP_SERVICE)
+        except (OSError, RuntimeError, asyncio.TimeoutError) as failure:
+            state, keep_dock, enabled, error = None, False, False, str(failure) or type(failure).__name__
+        busy = self._sleep_task is not None and not self._sleep_task.done()
+        return {
+            "state": state,
+            "enabled": enabled,
+            "keep_dock": keep_dock,
+            "busy": busy,
+            "error": error,
+            "can_change": PKEXEC.is_file() and not busy,
+        }
+
+    async def set_sleep_hook(self, installed):
+        if type(installed) is not bool:
+            raise ValueError("installed must be a boolean")
+        status = await self.get_sleep_hook_status()
+        if not status["can_change"]:
+            return status
+        return self._start_sleep_installer(status, () if installed else ("--remove",))
+
+    async def set_keep_dock(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        status = await self.get_sleep_hook_status()
+        if not status["can_change"] or status["state"] != "current":
+            return status
+        return self._start_sleep_installer(status, ("--keep-dock", "on" if enabled else "off"))
+
+    def _start_sleep_installer(self, status, args):
+        self._sleep_error = None
+        self._sleep_task = asyncio.create_task(self._run_sleep_installer(args))
+        return {**status, "busy": True, "can_change": False, "error": None}
+
+    async def _run_sleep_installer(self, args):
+        try:
+            await pkexec_python(SLEEP_HOOK_DIR / "install.py", *args)
+        except Exception as error:
+            self._sleep_error = str(error) or type(error).__name__
+
     async def _main(self):
         if self._settings.get("backlight_off"):
             try:
@@ -699,15 +946,73 @@ class Plugin:
             except (FileNotFoundError, OSError, PermissionError):
                 pass
         self._backlight_task = asyncio.create_task(self._keep_backlight_off())
+        self._switch_task = asyncio.create_task(self._auto_switch_loop())
+        # Keep an installed auto-fix in step with the plugin's GPU list.
+        try:
+            async with self._autofix_lock:
+                files = await asyncio.to_thread(autofix_files, self._home)
+                if await asyncio.to_thread(managed_state, files) == "outdated":
+                    await asyncio.to_thread(write_managed, files)
+                    await systemctl("daemon-reload")
+        except Exception:
+            pass
 
     async def _unload(self):
-        if self._backlight_task:
-            self._backlight_task.cancel()
+        for task in (self._backlight_task, self._switch_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._backlight_task = self._switch_task = None
+
+    async def get_auto_switch(self):
+        enabled = bool(self._settings.get("auto_switch"))
+        return {"enabled": enabled, "waiting": enabled and self._switch_due is not None}
+
+    async def set_auto_switch(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        # The backlight lock also serializes every settings write.
+        async with self._backlight_lock:
+            settings = {**self._settings, "auto_switch": enabled}
+            await asyncio.to_thread(save_settings, settings)
+            self._settings = settings
+        return await self.get_auto_switch()
+
+    async def _auto_switch_loop(self):
+        while True:
+            await asyncio.sleep(AUTO_SWITCH_POLL_SEC)
             try:
-                await self._backlight_task
-            except asyncio.CancelledError:
-                pass
-            self._backlight_task = None
+                await self._auto_switch_tick()
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                continue
+
+    async def _auto_switch_tick(self):
+        # Track sysfs nodes, not presence: across sleep the eGPU can be gone for
+        # less than one poll.
+        ready = {device["node"] for device in await asyncio.to_thread(gpu_status) if device["driver"] == "amdgpu"}
+        if not ready:
+            self._switch_due = None
+        elif self._egpu_ready is not None and not ready <= self._egpu_ready:
+            self._switch_due = time.monotonic() + AUTO_SWITCH_SETTLE_SEC
+        self._egpu_ready = ready
+        if self._switch_due is None or time.monotonic() < self._switch_due:
+            return
+        if not self._settings.get("auto_switch"):
+            self._switch_due = None
+            return
+        if await asyncio.to_thread(game_running):
+            return
+        self._switch_due = None
+        autofix = await unit_status(SERVICE)
+        if autofix.get("ActiveState") in ("activating", "deactivating") or autofix_restarted_recently():
+            return  # The boot-time auto-fix is handling this arrival.
+        try:
+            await self.restart_gamescope()
+        except RuntimeError:
+            pass  # Already restarting, or no Gamescope session to move.
 
     async def _keep_backlight_off(self):
         while True:

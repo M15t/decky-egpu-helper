@@ -1,0 +1,3 @@
+# Managed by eGPU Helper. Edits are overwritten when the plugin updates.
+# Keep the USB4 controller and its PCIe tunnel ports out of runtime suspend.
+ACTION=="add|bind", SUBSYSTEM=="pci", DRIVER=="thunderbolt", RUN+="/etc/egpu-sleep/egpu-sleep.sh pm on"
