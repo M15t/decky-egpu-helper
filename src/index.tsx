@@ -1,5 +1,5 @@
-import { callable, definePlugin } from "@decky/api";
-import { ButtonItem, ConfirmModal, Field, PanelSection, PanelSectionRow, ToggleField, showModal } from "@decky/ui";
+import { callable, definePlugin, toaster } from "@decky/api";
+import { ButtonItem, ConfirmModal, DialogButton, Field, Focusable, PanelSection, PanelSectionRow, ToggleField, showModal } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import { BsGpuCard } from "react-icons/bs";
 
@@ -62,20 +62,23 @@ const boltLabels: Record<string, string> = {
   unknown: "Unknown",
 };
 
-function headline(status: Status | null, error: string) {
-  if (!status) return error ? "Status unavailable" : "Checking…";
+function gpuRow(status: Status | null, error: string) {
+  if (!status) return { state: error ? "Unavailable" : "Checking…", name: undefined };
   const ready = status.devices.find(device => device.driver === "amdgpu");
-  if (ready) return `● ${ready.name ?? "eGPU"} ready`;
-  if (status.devices.length) return "On PCI · Driver not ready";
-  return "GPU not on PCI";
+  if (ready) return { state: "Ready", name: ready.name ?? undefined };
+  if (status.devices.length) return { state: "Driver not ready", name: status.devices[0].name ?? undefined };
+  return { state: "Not on PCI", name: undefined };
 }
 
-function dockLine(bolt: BoltStatus | null) {
-  if (!bolt) return "Checking dock…";
-  if (!bolt.available) return bolt.error ?? "boltctl unavailable";
+function dockRow(bolt: BoltStatus | null) {
+  if (!bolt) return { state: "Checking…", detail: undefined };
+  if (!bolt.available) return { state: "Unknown", detail: bolt.error ?? "boltctl unavailable" };
   const dock = bolt.devices[0];
-  if (!dock) return "No dock listed by boltctl";
-  return joinMeta(dock.name, boltLabels[dock.status] ?? dock.status, dock.status === "authorized" && dock.link);
+  if (!dock) return { state: "None", detail: "No dock listed by boltctl" };
+  return {
+    state: boltLabels[dock.status] ?? dock.status,
+    detail: joinMeta(dock.name, dock.status === "authorized" && dock.link) || undefined,
+  };
 }
 
 function StatusSection({ tick }: { tick: number }) {
@@ -119,14 +122,16 @@ function StatusSection({ tick }: { tick: number }) {
     requestPending.current = true;
     setRunning(true);
     setMessage("Requesting restart… Steam may disconnect.");
+    let result: string;
     try {
-      setMessage((await restartGamescope()).message);
+      result = (await restartGamescope()).message;
     } catch (failure) {
-      setMessage(`Could not confirm restart: ${errorText(failure)}. Check the session before retrying.`);
-    } finally {
-      requestPending.current = false;
-      setRunning(false);
+      result = `Could not confirm restart: ${errorText(failure)}. Check the session before retrying.`;
     }
+    requestPending.current = false;
+    setRunning(false);
+    setMessage(result);
+    toaster.toast({ title: "eGPU Helper", body: result });
   };
 
   const ready = Boolean(status?.devices.some(device => device.driver === "amdgpu"));
@@ -134,16 +139,26 @@ function StatusSection({ tick }: { tick: number }) {
     ? "Dock is in USB fallback. Press the TB5 button on the dock."
     : bolt?.pci_scan?.error ?? (error && status ? error : null);
 
+  const gpu = gpuRow(status, error);
+  const dock = dockRow(bolt);
   return (
     <PanelSection title="Status">
       <PanelSectionRow>
-        <Field label={headline(status, error)} childrenLayout="below" bottomSeparator="none">
-          <div>{dockLine(bolt)}</div>
-          {ready && <div>{status?.egpu_display ? "Display: eGPU" : "Display: built-in GPU"}</div>}
-          {hint && <div>{hint}</div>}
-          {!status && error && <div>{error}</div>}
-        </Field>
+        <Field label="eGPU" description={gpu.name}>{gpu.state}</Field>
       </PanelSectionRow>
+      <PanelSectionRow>
+        <Field label="Dock" description={dock.detail}>{dock.state}</Field>
+      </PanelSectionRow>
+      {ready && (
+        <PanelSectionRow>
+          <Field label="Display">{status?.egpu_display ? "eGPU" : "Built-in GPU"}</Field>
+        </PanelSectionRow>
+      )}
+      {(hint || (!status && error)) && (
+        <PanelSectionRow>
+          <Field description={hint ?? error} bottomSeparator="none" />
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <ButtonItem
           layout="below"
@@ -329,97 +344,6 @@ function SetupSection({ tick }: { tick: number }) {
   );
 }
 
-type DpiStatus = {
-  available: boolean; installed?: boolean; enabled: boolean; requested: boolean | null;
-  busy: boolean; state: string; error: string | null;
-  installing: boolean; can_install: boolean; install_error: string | null; install_hint: string | null;
-};
-const getDpiStatus = callable<[], DpiStatus>("get_dpi_status");
-const setDpiEnabled = callable<[boolean], DpiStatus>("set_dpi_enabled");
-const installDpiHelper = callable<[], DpiStatus>("install_dpi_helper");
-
-function DpiToggle() {
-  const [status, setStatus] = useState<DpiStatus | null>(null);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState("");
-  const busy = useRef(false);
-  const generation = useRef(0);
-  const mounted = useRef(false);
-  useEffect(() => {
-    mounted.current = true;
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = async () => {
-      const revision = generation.current;
-      if (!busy.current) {
-        try {
-          const next = await getDpiStatus();
-          if (!disposed && revision === generation.current) { setStatus(next); setError(""); }
-        } catch (failure) {
-          if (!disposed && revision === generation.current) {
-            setStatus(null);
-            setError(errorText(failure));
-          }
-        }
-      }
-      if (!disposed) timer = setTimeout(refresh, 4000);
-    };
-    void refresh();
-    return () => { disposed = true; mounted.current = false; clearTimeout(timer); };
-  }, []);
-  const toggle = async (value: boolean) => {
-    if (busy.current || !status?.available || status.busy || status.installing) return;
-    busy.current = true;
-    generation.current += 1;
-    setPending(true);
-    setError("");
-    try {
-      const next = await setDpiEnabled(value);
-      if (mounted.current) { setStatus(next); setError(next.error ?? ""); }
-    } catch (failure) {
-      if (mounted.current) { setStatus(null); setError(errorText(failure)); }
-    } finally {
-      busy.current = false;
-      if (mounted.current) setPending(false);
-    }
-  };
-  const install = async () => {
-    if (busy.current || !status?.can_install) return;
-    busy.current = true;
-    generation.current += 1;
-    setPending(true);
-    setError("");
-    try {
-      const next = await installDpiHelper();
-      if (mounted.current) setStatus(next);
-    } catch (failure) {
-      if (mounted.current) setError(errorText(failure));
-    } finally {
-      busy.current = false;
-      if (mounted.current) setPending(false);
-    }
-  };
-  return <><PanelSectionRow>
-    <ToggleField label="DPI bypass · Zapret2" checked={Boolean(status?.requested)}
-      disabled={pending || !status?.available || status.busy || status.installing}
-      description={pending ? "Applying…" : error || status?.error || (!status ? "Checking…" : status.enabled ? "Running · Restores ON after reboot" : "Off · Stays OFF after reboot")}
-      bottomSeparator="none" onChange={value => { void toggle(value); }} />
-  </PanelSectionRow>
-    {(status?.installing || status?.installed === false) && <PanelSectionRow>
-      <ButtonItem layout="below" disabled={pending || !status.can_install}
-        description={status.install_error || status.install_hint || (status.installing
-          ? "Approve the Linux administrator prompt. Setup status updates automatically."
-          : "One-time setup. Linux may ask for administrator approval.")}
-        onClick={() => { void install(); }}>
-        {status.installing ? "Installing helper…" : "Install helper"}
-      </ButtonItem>
-    </PanelSectionRow>}
-    {status?.install_error && !status.available && status.installed !== false && !status.installing && <PanelSectionRow>
-      <Field label="Helper setup" childrenLayout="below" bottomSeparator="none">{status.install_error}</Field>
-    </PanelSectionRow>}
-  </>;
-}
-
 function ToolsSection({ onRefresh }: { onRefresh: () => void }) {
   const [backlight, setBacklight] = useState<BacklightStatus | null>(null);
   const pending = useRef(false);
@@ -460,7 +384,6 @@ function ToolsSection({ onRefresh }: { onRefresh: () => void }) {
 
   return (
     <PanelSection title="Tools">
-      <DpiToggle />
       <PanelSectionRow>
         <ToggleField
           label="Force off internal backlight"
@@ -477,13 +400,37 @@ function ToolsSection({ onRefresh }: { onRefresh: () => void }) {
   );
 }
 
+type Page = "main" | "setup";
+const pageLabels: Record<Page, string> = { main: "Main", setup: "Setup" };
+let lastPage: Page = "main";
+
 function Content() {
   const [tick, setTick] = useState(0);
+  const [page, setPage] = useState<Page>(lastPage);
+  const go = (next: Page) => { lastPage = next; setPage(next); };
   return (
     <>
-      <StatusSection tick={tick} />
-      <SetupSection tick={tick} />
-      <ToolsSection onRefresh={() => setTick(value => value + 1)} />
+      <PanelSection>
+        <Focusable style={{ display: "flex", gap: "4px" }} flow-children="horizontal">
+          {(Object.keys(pageLabels) as Page[]).map(p => (
+            <DialogButton
+              key={p}
+              style={{ minWidth: 0, flex: 1, padding: "6px 4px", fontSize: "12px", opacity: page === p ? 1 : 0.55 }}
+              onClick={() => go(p)}
+            >
+              {pageLabels[p]}
+            </DialogButton>
+          ))}
+        </Focusable>
+      </PanelSection>
+      {page === "main" ? (
+        <>
+          <StatusSection tick={tick} />
+          <ToolsSection onRefresh={() => setTick(value => value + 1)} />
+        </>
+      ) : (
+        <SetupSection tick={tick} />
+      )}
     </>
   );
 }
