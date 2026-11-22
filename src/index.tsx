@@ -35,6 +35,12 @@ type InstallState = "current" | "outdated" | "missing" | "foreign";
 type AutofixStatus = { state: InstallState; enabled: boolean };
 type SleepHookStatus = { state: InstallState | null; enabled: boolean; keep_dock: boolean; busy: boolean; error: string | null; can_change: boolean };
 type AutoSwitchStatus = { enabled: boolean; waiting: boolean };
+type ShaderStatus = { state: InstallState };
+type ShaderInfo = {
+  active: string | null;
+  profiles: { id: string; label: string; bytes: number }[];
+  games: { appid: string; name: string; sizes: Record<string, number> }[];
+};
 
 const getStatus = callable<[], Status>("get_status");
 const getBoltStatus = callable<[], BoltStatus>("get_bolt_status");
@@ -49,7 +55,14 @@ const setSleepHook = callable<[boolean], SleepHookStatus>("set_sleep_hook");
 const setKeepDock = callable<[boolean], SleepHookStatus>("set_keep_dock");
 const getAutoSwitch = callable<[], AutoSwitchStatus>("get_auto_switch");
 const setAutoSwitch = callable<[boolean], AutoSwitchStatus>("set_auto_switch");
-const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const getShaderStatus = callable<[], ShaderStatus>("get_shader_status");
+const setShaderSwap = callable<[boolean], ShaderStatus>("set_shader_swap");
+const getShaderInfo = callable<[], ShaderInfo>("get_shader_info");
+const deleteInactiveShaders = callable<[string], { freed: number }>("delete_inactive_shaders");
+const getVersion = callable<[], string>("get_version");
+const formatBytes = (bytes: number) =>
+  bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`;
+const errorText =(error: unknown) => error instanceof Error ? error.message : String(error);
 const joinMeta = (...parts: Array<string | null | undefined | false>) => parts.filter(Boolean).join(" · ");
 
 const boltLabels: Record<string, string> = {
@@ -334,6 +347,130 @@ function AutoSwitchToggle({ tick }: { tick: number }) {
   );
 }
 
+function ShaderToggle({ tick }: { tick: number }) {
+  const [status, setStatus] = useState<ShaderStatus | null>(null);
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  useEffect(() => {
+    getShaderStatus().then(next => { setStatus(next); setError(""); }, failure => setError(errorText(failure)));
+  }, [tick]);
+  const change = async (on: boolean) => {
+    setPending(true);
+    setError("");
+    try {
+      setStatus(await setShaderSwap(on));
+    } catch (failure) {
+      setError(errorText(failure));
+      await getShaderStatus().then(setStatus, () => setStatus(null));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <PanelSectionRow>
+      <ToggleField
+        label="Separate shader cache per GPU"
+        checked={status?.state === "current"}
+        disabled={pending || !status}
+        description={pending ? "Applying…" : error || (!status ? "Checking…" : installDescription(
+          status.state,
+          "Hand-installed copy found. Turning on replaces it and keeps a .bak.",
+          "Keeps Steam's shaders for the eGPU and the built-in GPU apart, so switching does not process them again. Takes effect the next time Gamescope starts.",
+        ))}
+        bottomSeparator="none"
+        onChange={on => { void change(on); }}
+      />
+    </PanelSectionRow>
+  );
+}
+
+function VersionRow() {
+  const [version, setVersion] = useState("");
+  useEffect(() => { getVersion().then(setVersion, () => setVersion("unknown")); }, []);
+  return (
+    <div style={{ fontSize: "11px", opacity: 0.5, textAlign: "center", padding: "4px 0 8px" }}>
+      eGPU Helper {version ? `v${version}` : ""}
+    </div>
+  );
+}
+
+function ShadersPage({ tick }: { tick: number }) {
+  const [info, setInfo] = useState<ShaderInfo | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = () => getShaderInfo().then(next => { setInfo(next); setError(""); }, failure => setError(errorText(failure)));
+  useEffect(() => { void load(); }, [tick]);
+
+  const remove = async (game: ShaderInfo["games"][number]) => {
+    setBusy(true);
+    try {
+      const { freed } = await deleteInactiveShaders(game.appid);
+      toaster.toast({ title: "eGPU Helper", body: `${game.name}: freed ${formatBytes(freed)}` });
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setBusy(false);
+      void load();
+    }
+  };
+
+  const label = (id: string) => info?.profiles.find(p => p.id === id)?.label ?? id;
+  const inactiveBytes = (game: ShaderInfo["games"][number]) =>
+    Object.entries(game.sizes).filter(([id]) => id !== info?.active).reduce((sum, [, bytes]) => sum + bytes, 0);
+
+  return (
+    <>
+      <PanelSection title="Shaders">
+        <ShaderToggle tick={tick} />
+        {info?.active && (
+          <PanelSectionRow>
+            <Field label="Active">{label(info.active)}</Field>
+          </PanelSectionRow>
+        )}
+        {info?.profiles.map(profile => (
+          <PanelSectionRow key={profile.id}>
+            <Field label={profile.label} bottomSeparator="none">{formatBytes(profile.bytes)}</Field>
+          </PanelSectionRow>
+        ))}
+        {(error || (!info && "Measuring shader caches…")) && (
+          <PanelSectionRow>
+            <Field description={error || "Measuring shader caches…"} bottomSeparator="none" />
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+      {info && info.games.length > 0 && (
+        <PanelSection title="Per game">
+          {info.games.map(game => {
+            const spare = inactiveBytes(game);
+            return (
+              <PanelSectionRow key={game.appid}>
+                <ButtonItem
+                  layout="below"
+                  label={game.name}
+                  description={Object.entries(game.sizes).map(([id, bytes]) => `${label(id)}: ${formatBytes(bytes)}`).join(" · ")}
+                  disabled={busy || spare === 0}
+                  onClick={() => showModal(
+                    <ConfirmModal
+                      strTitle={`Delete unused shaders for ${game.name}?`}
+                      strDescription={`Frees ${formatBytes(spare)} from GPUs not in use now. The copy Steam is using stays. Steam should rebuild the deleted shaders when this game next runs on that GPU.`}
+                      strOKButtonText="Delete"
+                      strCancelButtonText="Cancel"
+                      bDestructiveWarning
+                      onOK={() => { void remove(game); }}
+                    />,
+                  )}
+                >
+                  {spare ? `Delete unused (${formatBytes(spare)})` : "Only the active GPU has shaders"}
+                </ButtonItem>
+              </PanelSectionRow>
+            );
+          })}
+        </PanelSection>
+      )}
+    </>
+  );
+}
+
 function SetupSection({ tick }: { tick: number }) {
   return (
     <PanelSection title="Setup">
@@ -400,8 +537,8 @@ function ToolsSection({ onRefresh }: { onRefresh: () => void }) {
   );
 }
 
-type Page = "main" | "setup";
-const pageLabels: Record<Page, string> = { main: "Main", setup: "Setup" };
+type Page = "main" | "shaders" | "setup";
+const pageLabels: Record<Page, string> = { main: "Main", shaders: "Shaders", setup: "Setup" };
 let lastPage: Page = "main";
 
 function Content() {
@@ -427,7 +564,10 @@ function Content() {
         <>
           <StatusSection tick={tick} />
           <ToolsSection onRefresh={() => setTick(value => value + 1)} />
+          <VersionRow />
         </>
+      ) : page === "shaders" ? (
+        <ShadersPage tick={tick} />
       ) : (
         <SetupSection tick={tick} />
       )}

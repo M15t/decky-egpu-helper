@@ -1,9 +1,11 @@
 import asyncio
+import importlib.util
 import json
 import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import time
 
 
@@ -517,6 +519,119 @@ def autofix_files(home):
     ]
 
 
+SHADERS_DIR = Path(__file__).resolve().parent / "shaders"
+SHADER_DROPIN = "egpu-helper-shaders.conf"
+STEAM_DROPIN = "egpu-helper-steam.conf"
+
+
+def shader_files(home):
+    script = (SHADERS_DIR / "egpu-shader-swap.py").read_text().replace("@EGPU_DEVICES@", ",".join(EGPU_DEVICES))
+    return [
+        (home / ".local/bin/egpu-shader-swap.py", script, 0o755),
+        (home / ".config/systemd/user/gamescope-session.service.d" / SHADER_DROPIN,
+         (SHADERS_DIR / SHADER_DROPIN).read_text(), 0o644),
+        (home / ".config/systemd/user/steam-launcher.service.d" / STEAM_DROPIN,
+         (SHADERS_DIR / STEAM_DROPIN).read_text(), 0o644),
+    ]
+
+
+def swap_script(home):
+    """The shader swap script as a module, so the plugin reads Steam's layout the same way it does."""
+    spec = importlib.util.spec_from_file_location("egpu_shader_swap", SHADERS_DIR / "egpu-shader-swap.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.EGPU_DEVICES = tuple(f"0x{device}" for device in EGPU_DEVICES)
+    module.STEAM = home / ".local/share/Steam"
+    module.STATE = home / ".local/share/egpu-helper/shaders"
+    return module
+
+
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def profile_label(profile, chips):
+    if profile == "igpu":
+        return "Built-in GPU"
+    device = profile.removeprefix("egpu-")
+    return f"eGPU · {chips.get(device, device)}"
+
+
+def game_names(steamapps):
+    names = {}
+    for manifest in steamapps.glob("appmanifest_*.acf"):
+        try:
+            match = re.search(r'"name"\s+"([^"]*)"', manifest.read_text(errors="replace"))
+        except OSError:
+            continue
+        if match:
+            names[manifest.stem.removeprefix("appmanifest_")] = match.group(1)
+    return names
+
+
+def shader_info(swap):
+    """Shader copies per GPU profile and per game, across every Steam library."""
+    libraries = swap.libraries()
+    active = next((p for p in (linked_profile(swap, lib) for lib in libraries) if p), None)
+    chips = swap.chip_names()
+    totals, games = {}, {}
+    for steamapps in libraries:
+        names = game_names(steamapps)
+        for folder in steamapps.glob("shadercache.*"):
+            profile = folder.name.removeprefix("shadercache.")
+            if folder.is_symlink() or not folder.is_dir() or not re.fullmatch(swap.PROFILE, profile):
+                continue
+            for game in folder.iterdir():
+                if not game.name.isdigit() or game.is_symlink() or not game.is_dir():
+                    continue
+                size = dir_size(game)
+                totals[profile] = totals.get(profile, 0) + size
+                entry = games.setdefault(game.name, {"appid": game.name, "name": names.get(game.name) or f"App {game.name}", "sizes": {}})
+                entry["sizes"][profile] = entry["sizes"].get(profile, 0) + size
+    profiles = sorted(set(totals) | ({active} if active else set()), key=lambda p: (p != active, p))
+    return {
+        "active": active,
+        "profiles": [{"id": p, "label": profile_label(p, chips), "bytes": totals.get(p, 0)} for p in profiles],
+        "games": sorted(games.values(), key=lambda g: -sum(g["sizes"].values())),
+    }
+
+
+def linked_profile(swap, steamapps):
+    """Profile whose folder Steam reads in this library, from the shadercache symlink itself."""
+    cache = steamapps / "shadercache"
+    if not cache.is_symlink():
+        return None
+    match = swap.LINK_TARGET.fullmatch(os.readlink(cache))
+    return match.group(1) if match else None
+
+
+def delete_inactive_shaders(swap, appid):
+    """Delete one game's shader copies for every GPU profile except the one Steam reads."""
+    if not re.fullmatch(r"\d{1,10}", appid):
+        raise ValueError("Invalid app ID")
+    freed = 0
+    for steamapps in swap.libraries():
+        active = linked_profile(swap, steamapps)
+        if not active:
+            continue
+        for folder in steamapps.glob("shadercache.*"):
+            profile = folder.name.removeprefix("shadercache.")
+            if profile == active or folder.is_symlink() or not re.fullmatch(swap.PROFILE, profile):
+                continue
+            game = folder / appid
+            if game.is_dir() and not game.is_symlink():
+                freed += dir_size(game)
+                shutil.rmtree(game)
+    return freed
+
+
 def managed_state(files):
     texts = [path.read_text() if path.is_file() else None for path, _, _ in files]
     if any(text is not None and MANAGED not in text for text in texts):
@@ -736,6 +851,34 @@ class Plugin:
             await systemctl("daemon-reload")
             return await self._autofix_status()
 
+    async def get_version(self):
+        return json.loads((Path(__file__).resolve().parent / "package.json").read_text())["version"]
+
+    async def get_shader_status(self):
+        return {"state": await asyncio.to_thread(lambda: managed_state(shader_files(self._home)))}
+
+    async def get_shader_info(self):
+        return await asyncio.to_thread(lambda: shader_info(swap_script(self._home)))
+
+    async def delete_inactive_shaders(self, appid):
+        if type(appid) is not str:
+            raise ValueError("appid must be a string")
+        freed = await asyncio.to_thread(lambda: delete_inactive_shaders(swap_script(self._home), appid))
+        return {"freed": freed}
+
+    async def set_shader_swap(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        async with self._autofix_lock:
+            files = await asyncio.to_thread(shader_files, self._home)
+            if enabled:
+                await asyncio.to_thread(write_managed, files)
+            else:
+                # Steam keeps using the active GPU's cache through the symlink; nothing is merged back.
+                await asyncio.to_thread(remove_managed, files)
+            await systemctl("daemon-reload")
+        return await self.get_shader_status()
+
     async def get_sleep_hook_status(self):
         error = self._sleep_error
         try:
@@ -791,9 +934,14 @@ class Plugin:
         # Keep an installed auto-fix in step with the plugin's GPU list.
         try:
             async with self._autofix_lock:
-                files = await asyncio.to_thread(autofix_files, self._home)
-                if await asyncio.to_thread(managed_state, files) == "outdated":
-                    await asyncio.to_thread(write_managed, files)
+                changed = False
+                for files in await asyncio.to_thread(lambda: (autofix_files(self._home), shader_files(self._home))):
+                    state = await asyncio.to_thread(managed_state, files)
+                    # "missing" with some files present: an update added a file to a managed install.
+                    if state == "outdated" or (state == "missing" and any(path.is_file() for path, _, _ in files)):
+                        await asyncio.to_thread(write_managed, files)
+                        changed = True
+                if changed:
                     await systemctl("daemon-reload")
         except Exception:
             pass

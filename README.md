@@ -8,7 +8,8 @@ A standalone Decky plugin for AMD eGPUs listed in `EGPU_DEVICES` in `main.py`:
   When the dock only enumerates its USB controller (no USB4 link), it says to
   press the TB5 button on the dock.
 - Manually restart `gamescope-session.target` after confirmation.
-- **Setup** toggles the boot-time auto-fix, auto-switch, and the sleep hook (see below).
+- **Setup** toggles the boot-time auto-fix, auto-switch, the sleep hook, and
+  separate shader caches per GPU (see below).
 - Optionally force the internal panel backlight off. Preference is remembered.
   Gamescope may rewrite brightness, so the plugin keeps writing `0` while the
   toggle is on. It does not auto-restore when the eGPU unplugs.
@@ -146,6 +147,56 @@ return shorter than its 2-second poll still counts as an arrival.
   released until wake, so expect light sleep on battery until then.
 - If rebinding fails after wake, the journal shows `egpu-sleep: rebinding ...
   failed` and the PCI rescan still runs. Reboot to recover the dock.
+
+## Separate shader cache per GPU
+
+Steam keeps one shader cache and remembers which GPU built it. Switching between
+the eGPU and the built-in GPU makes Steam process every game's shaders again.
+**Shaders → Separate shader cache per GPU** keeps one copy per GPU. It is off by
+default.
+
+Turning it on writes `~/.local/bin/egpu-shader-swap.py` and a drop-in,
+`~/.config/systemd/user/gamescope-session.service.d/egpu-helper-shaders.conf`,
+that runs the script before Gamescope and Steam start. Nothing changes until the
+next Gamescope start.
+
+- The script picks `egpu-<device ID>` when a supported eGPU has `amdgpu` bound,
+  otherwise `igpu`. At boot, before the eGPU is up, that is `igpu`; the auto-fix
+  or auto-switch restart then moves to the eGPU profile.
+- Each library's `steamapps/shadercache` becomes a symlink to
+  `shadercache.<profile>`. The `ShaderCacheManager` block of
+  `~/.local/share/Steam/config/config.vdf` is saved per profile in
+  `~/.local/share/egpu-helper/shaders/` and put back on switch. The previous
+  `config.vdf` is kept as `config.vdf.egpu-bak`.
+- The first time, the existing cache is filed under the GPU named in Steam's
+  `CurrentBucketGPU` (matched by chip, such as `NAVI23`, from `pci.ids`), or under
+  `igpu` if none matches. The other GPU starts empty and processes its shaders once.
+- The script also writes `$XDG_RUNTIME_DIR/egpu-helper-environment` with
+  `DRI_PRIME` set to the profile's GPU, and a drop-in,
+  `~/.config/systemd/user/steam-launcher.service.d/egpu-helper-steam.conf`, makes
+  Steam read it. Without it, Steam's OpenGL probe sometimes picks the other GPU,
+  decides its shader bucket changed, and prunes compiled shaders.
+- Each profile keeps its own copy, so expect up to about twice the disk space
+  of today's `shadercache` folder.
+- It never deletes a cache, skips a library whose `shadercache` is a symlink it
+  did not make, and does nothing while Steam runs. Errors are logged
+  (`journalctl --user -u gamescope-session -b | grep egpu-shader-swap`) and never
+  stop the session.
+
+The **Shaders** tab shows the active GPU, the size of each GPU's copy, and each
+game's size per GPU (names come from `appmanifest_*.acf`). **Delete unused**
+removes one game's copies for every GPU except the active one, after
+confirmation. It never touches the active copy, which Steam is using.
+
+Turning it off removes the drop-in and script. Steam keeps using the last
+profile's folder through the symlink. To merge it back into a plain folder,
+exit Steam in Desktop Mode and run:
+
+```sh
+python3 ~/homebrew/plugins/egpu-gamescope/shaders/egpu-shader-swap.py --restore
+```
+
+Other profiles' folders stay; delete them by hand if you want the space back.
 
 ## Build and install
 
