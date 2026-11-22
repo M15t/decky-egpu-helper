@@ -661,21 +661,29 @@ class SleepHookTests(unittest.IsolatedAsyncioTestCase):
         rule = next(content for path, content, _ in self.files if path.suffix == ".rules")
         self.assertIn(f'RUN+="{script} pm on"', rule)
 
-    async def test_cancelled_prompt_is_reported(self):
+    async def test_wrong_password_is_reported(self):
         plugin = main.Plugin()
-        process = AsyncMock(returncode=126)
-        process.communicate.return_value = (b"", b"")
+        process = AsyncMock(returncode=1)
+        process.communicate.return_value = (b"", b"sudo: 1 incorrect password attempt\n")
         with patch.object(main, "sleep_hook_files", return_value=self.files), \
                 patch.object(main, "system_unit_enabled", new=AsyncMock(return_value=False)), \
-                patch.object(main, "PKEXEC", Path("/bin/sh")), \
+                patch.object(main, "SUDO", Path("/bin/sh")), \
                 patch.object(main.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn:
-            status = await plugin.set_sleep_hook(True)
+            status = await plugin.set_sleep_hook(True, "hunter2")
             self.assertTrue(status["busy"])
             await plugin._sleep_task
             status = await plugin.get_sleep_hook_status()
-        self.assertEqual(status["error"], "Cancelled. You can try again.")
+        self.assertEqual(status["error"], "Wrong password. You can try again.")
+        self.assertEqual(process.communicate.await_args.args, (b"hunter2\n",))
+        self.assertEqual(spawn.await_args.args[:2], ("/bin/sh", "-S"))
         self.assertEqual(status["state"], "missing")
         self.assertNotIn("--remove", spawn.await_args.args)
+
+    async def test_password_is_required(self):
+        plugin = main.Plugin()
+        for password in (None, "", "a\nb"):
+            with self.subTest(password=password), self.assertRaises(ValueError):
+                await plugin.set_sleep_hook(True, password)
 
     async def test_keep_dock_needs_current_hook(self):
         plugin = main.Plugin()
@@ -683,14 +691,14 @@ class SleepHookTests(unittest.IsolatedAsyncioTestCase):
         process.communicate.return_value = (b"", b"")
         with patch.object(main, "sleep_hook_files", return_value=self.files), \
                 patch.object(main, "system_unit_enabled", new=AsyncMock(return_value=True)), \
-                patch.object(main, "PKEXEC", Path("/bin/sh")), \
+                patch.object(main, "SUDO", Path("/bin/sh")), \
                 patch.object(main.asyncio, "create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn:
-            status = await plugin.set_keep_dock(True)
+            status = await plugin.set_keep_dock(True, "hunter2")
             self.assertFalse(status["busy"])
             spawn.assert_not_awaited()
             self.files[0][0].parent.mkdir(parents=True)
             main.write_managed(self.files)
-            status = await plugin.set_keep_dock(True)
+            status = await plugin.set_keep_dock(True, "hunter2")
             self.assertTrue(status["busy"])
             await plugin._sleep_task
         self.assertEqual(spawn.await_args.args[-2:], ("--keep-dock", "on"))

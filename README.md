@@ -93,6 +93,21 @@ With the eGPU attached, the Ally can hang in s2idle and never wake. The sleep
 hook is a system unit, `egpu-sleep.service`, tied to `sleep.target`. Before
 sleep it removes the eGPU's PCI functions; after wake it rescans PCI.
 
+If Gamescope is rendering on the eGPU, removing the card crashes it, so the hook
+first stops that user's `gamescope-session.target`. SDDM logs back in on the
+built-in GPU; after wake, auto-switch (or **Restart**) moves the session back.
+A game running at sleep time is closed either way.
+It also stops `lactd` (LACT) before removing the card and starts it after wake;
+otherwise LACT segfaults and leaves a stale `/run/lactd.sock` that blocks its restart.
+Once amdgpu lets go of the card, its firmware spins the fans hard for the whole
+sleep. The hook first sets a fixed fan speed, which the card keeps after removal.
+It asks the card for an RPM target, a share of the card's own `fan1_max`, chosen
+from the hottest sensor at that moment: 25% below 55 °C, 35% below 70 °C, 45% below
+85 °C, 60% above. An RPM target works on any card; a fixed PWM does not, since fans
+start at different PWMs (an RX 6600 stays still at 25%). Cards without RPM control
+get a PWM a little above the same share. It never stops the fan, because nothing can restart it
+until amdgpu probes the card again; amdgpu puts the fans back on auto when it probes the card after wake.
+
 The USB4 link to the AG03 still drops during sleep (`TB_PORT_UP ... lost during
 suspend`), so press the dock's TB5 button after waking, then restart Gamescope.
 The dock stays stuck after the kernel's USB4 router sleep; even a reboot does
@@ -106,13 +121,15 @@ the GPU off PCI until a rescan. A udev rule, `90-egpu-helper.rules`, runs
 `power/control` to `on` for the controller and the PCIe ports it tunnels. This
 costs some idle power.
 
-**Setup → Sleep hook** runs `sleephook/install.py` through `pkexec`. It writes
+**Setup → Sleep hook** asks for the `deck` password and runs
+`sleephook/install.py` through `sudo`. The password goes to `sudo` on stdin and
+is not stored. It writes
 `/etc/egpu-sleep/egpu-sleep.sh`, `/etc/systemd/system/egpu-sleep.service` and
 `/etc/udev/rules.d/90-egpu-helper.rules`, enables the unit, and applies the
 runtime PM setting right away. Hand-installed copies are kept as `.bak`. The
 script's ID pattern comes from `EGPU_DEVICES`. Turning the toggle off disables
-the unit, restores runtime PM to `auto`, and deletes the managed files. It needs a polkit agent; in
-Gaming Mode without one, use Desktop Mode or run as root:
+the unit, restores runtime PM to `auto`, and deletes the managed files. To do
+the same from a terminal:
 
 ```sh
 sudo /usr/bin/python3 sleephook/install.py                   # install or update

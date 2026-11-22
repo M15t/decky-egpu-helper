@@ -1,4 +1,4 @@
-"""Install or remove the eGPU sleep hook. Runs as root through pkexec."""
+"""Install or remove the eGPU sleep hook. Runs as root through sudo."""
 import argparse
 import os
 from pathlib import Path

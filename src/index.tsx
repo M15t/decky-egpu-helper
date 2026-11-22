@@ -1,5 +1,5 @@
 import { callable, definePlugin, toaster } from "@decky/api";
-import { ButtonItem, ConfirmModal, DialogButton, Field, Focusable, PanelSection, PanelSectionRow, ToggleField, showModal } from "@decky/ui";
+import { ButtonItem, ConfirmModal, DialogButton, Field, Focusable, PanelSection, PanelSectionRow, TextField, ToggleField, showModal } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import { BsGpuCard } from "react-icons/bs";
 
@@ -51,8 +51,8 @@ const getAutofixStatus = callable<[], AutofixStatus>("get_autofix_status");
 const installAutofix = callable<[], AutofixStatus>("install_autofix");
 const removeAutofix = callable<[], AutofixStatus>("remove_autofix");
 const getSleepHookStatus = callable<[], SleepHookStatus>("get_sleep_hook_status");
-const setSleepHook = callable<[boolean], SleepHookStatus>("set_sleep_hook");
-const setKeepDock = callable<[boolean], SleepHookStatus>("set_keep_dock");
+const setSleepHook = callable<[boolean, string], SleepHookStatus>("set_sleep_hook");
+const setKeepDock = callable<[boolean, string], SleepHookStatus>("set_keep_dock");
 const getAutoSwitch = callable<[], AutoSwitchStatus>("get_auto_switch");
 const setAutoSwitch = callable<[boolean], AutoSwitchStatus>("set_auto_switch");
 const getShaderStatus = callable<[], ShaderStatus>("get_shader_status");
@@ -243,6 +243,30 @@ function AutofixToggle({ tick }: { tick: number }) {
   );
 }
 
+// Game Mode has no polkit agent, so the backend runs the installer through sudo with this password.
+function askPassword(onPassword: (password: string) => void) {
+  let password = "";
+  showModal(
+    <ConfirmModal
+      strTitle="Administrator password"
+      strOKButtonText="Continue"
+      onOK={() => { if (password) onPassword(password); }}
+    >
+      {/* bIsPassword alone does not mask the text in Game Mode; Chromium's text-security does. */}
+      <style>{".egpu-password input { -webkit-text-security: disc; }"}</style>
+      <div className="egpu-password">
+        <TextField
+          label="Password for the deck user"
+          description="Passed to sudo for this change only. Not stored."
+          bIsPassword
+          focusOnMount
+          onChange={event => { password = event.target.value; }}
+        />
+      </div>
+    </ConfirmModal>,
+  );
+}
+
 function SleepHookToggle({ tick }: { tick: number }) {
   const [status, setStatus] = useState<SleepHookStatus | null>(null);
   const [error, setError] = useState("");
@@ -266,19 +290,19 @@ function SleepHookToggle({ tick }: { tick: number }) {
     void refresh();
     return () => { disposed = true; clearTimeout(timer); };
   }, [tick, requested, requestedKeep]);
-  const change = async (on: boolean) => {
+  const change = async (on: boolean, password: string) => {
     setError("");
     try {
-      setStatus(await setSleepHook(on));
+      setStatus(await setSleepHook(on, password));
       setRequested(on);
     } catch (failure) {
       setError(errorText(failure));
     }
   };
-  const changeKeep = async (on: boolean) => {
+  const changeKeep = async (on: boolean, password: string) => {
     setError("");
     try {
-      setStatus(await setKeepDock(on));
+      setStatus(await setKeepDock(on, password));
       setRequestedKeep(on);
     } catch (failure) {
       setError(errorText(failure));
@@ -292,13 +316,13 @@ function SleepHookToggle({ tick }: { tick: number }) {
         label="Sleep hook"
         checked={requested ?? installed}
         disabled={!status?.can_change}
-        description={status?.busy ? "Approve the administrator prompt…" : error || status?.error || (!status ? "Checking…" : installDescription(
+        description={status?.busy ? "Applying…" : error || status?.error || (!status ? "Checking…" : installDescription(
           status.state,
           "Hand-installed hook found. Turning on replaces it and keeps a .bak.",
           "Detaches the eGPU before sleep so the Ally can wake, and keeps the USB4 link awake. Press TB5 on the dock after waking, unless Keep dock linked is on.",
         ))}
         bottomSeparator={installed ? "standard" : "none"}
-        onChange={on => { void change(on); }}
+        onChange={on => askPassword(password => { void change(on, password); })}
       />
     </PanelSectionRow>
     {installed && (
@@ -307,9 +331,9 @@ function SleepHookToggle({ tick }: { tick: number }) {
           label="Keep dock linked during sleep"
           checked={requestedKeep ?? status.keep_dock}
           disabled={!status.can_change}
-          description={status.busy ? "Approve the administrator prompt…" : "Experimental. While a dock is attached, the Ally sleeps lightly so the dock comes back without TB5. The eGPU's fans keep spinning during sleep. One test sleep crashed and rebooted the Ally."}
+          description={status.busy ? "Applying…" : "Experimental. While a dock is attached, the Ally sleeps lightly so the dock comes back without TB5. The eGPU's fans keep spinning during sleep. One test sleep crashed and rebooted the Ally."}
           bottomSeparator="none"
-          onChange={on => { void changeKeep(on); }}
+          onChange={on => askPassword(password => { void changeKeep(on, password); })}
         />
       </PanelSectionRow>
     )}

@@ -699,24 +699,30 @@ async def system_unit_enabled(unit):
     return stdout.decode(errors="replace").strip() == "UnitFileState=enabled"
 
 
-async def pkexec_python(script, *args):
+async def sudo_python(password, script, *args):
+    """Run a script as root with sudo. Game Mode has no polkit agent, so pkexec cannot prompt there."""
     process = await asyncio.create_subprocess_exec(
-        str(PKEXEC), "--disable-internal-agent", "/usr/bin/python3", "-E", "-s", str(script), *args,
-        stdin=asyncio.subprocess.DEVNULL,
+        str(SUDO), "-S", "-k", "-p", "", "--", "/usr/bin/python3", "-E", "-s", str(script), *args,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, cwd="/",
     )
     # Never kill an authorized root process mid-write.
-    _, stderr = await process.communicate()
-    if process.returncode == 126:
-        raise RuntimeError("Cancelled. You can try again.")
-    if process.returncode == 127:
-        raise RuntimeError("Administrator authorization failed or no prompt is available. Try Desktop Mode or the README terminal setup.")
-    if process.returncode:
-        raise RuntimeError(stderr.decode(errors="replace").strip()[-2000:] or "Sleep hook setup failed.")
+    _, stderr = await process.communicate(f"{password}\n".encode())
+    if not process.returncode:
+        return
+    text = stderr.decode(errors="replace").strip()
+    if "incorrect password" in text or "no password was provided" in text:
+        raise RuntimeError("Wrong password. You can try again.")
+    raise RuntimeError(text[-2000:] or "Sleep hook setup failed.")
 
 
-PKEXEC = Path("/usr/bin/pkexec")
+SUDO = Path("/usr/bin/sudo")
+
+
+def check_password(password):
+    if type(password) is not str or not password or "\n" in password:
+        raise ValueError("Enter the deck user's password.")
 
 
 class Plugin:
@@ -893,33 +899,35 @@ class Plugin:
             "keep_dock": keep_dock,
             "busy": busy,
             "error": error,
-            "can_change": PKEXEC.is_file() and not busy,
+            "can_change": SUDO.is_file() and not busy,
         }
 
-    async def set_sleep_hook(self, installed):
+    async def set_sleep_hook(self, installed, password):
         if type(installed) is not bool:
             raise ValueError("installed must be a boolean")
+        check_password(password)
         status = await self.get_sleep_hook_status()
         if not status["can_change"]:
             return status
-        return self._start_sleep_installer(status, () if installed else ("--remove",))
+        return self._start_sleep_installer(status, password, () if installed else ("--remove",))
 
-    async def set_keep_dock(self, enabled):
+    async def set_keep_dock(self, enabled, password):
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
+        check_password(password)
         status = await self.get_sleep_hook_status()
         if not status["can_change"] or status["state"] != "current":
             return status
-        return self._start_sleep_installer(status, ("--keep-dock", "on" if enabled else "off"))
+        return self._start_sleep_installer(status, password, ("--keep-dock", "on" if enabled else "off"))
 
-    def _start_sleep_installer(self, status, args):
+    def _start_sleep_installer(self, status, password, args):
         self._sleep_error = None
-        self._sleep_task = asyncio.create_task(self._run_sleep_installer(args))
+        self._sleep_task = asyncio.create_task(self._run_sleep_installer(password, args))
         return {**status, "busy": True, "can_change": False, "error": None}
 
-    async def _run_sleep_installer(self, args):
+    async def _run_sleep_installer(self, password, args):
         try:
-            await pkexec_python(SLEEP_HOOK_DIR / "install.py", *args)
+            await sudo_python(password, SLEEP_HOOK_DIR / "install.py", *args)
         except Exception as error:
             self._sleep_error = str(error) or type(error).__name__
 
