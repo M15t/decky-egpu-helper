@@ -1,0 +1,3 @@
+# Managed by eGPU Helper. Edits are overwritten when the plugin updates.
+# Auto-switch gives a hot-plugged eGPU its full BAR with this one command.
+@USER@ ALL=(root) NOPASSWD: @SCRIPT@ rebar

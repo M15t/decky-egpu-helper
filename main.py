@@ -13,7 +13,7 @@ PCI_DEVICES = Path("/sys/bus/pci/devices")
 BACKLIGHT = Path("/sys/class/backlight")
 AMD_VENDOR = "1002"
 # RX 6600 (Navi 23) and RX 9070 / 9070 XT (Navi 48).
-EGPU_DEVICES = ("73ff", "7550")
+EGPU_DEVICES = ("73ff", "73bf", "7550")
 SERVICE = "egpu-gamescope-fix.service"
 TARGET = "gamescope-session.target"
 SETTINGS_FILE = "settings.json"
@@ -26,7 +26,31 @@ AUTOFIX_GRACE_SEC = 30
 RADEON_BRACKET = re.compile(r"\[([^\]]*Radeon[^\]]*)\]", re.IGNORECASE)
 
 
+AMDGPU_IDS = Path("/usr/share/libdrm/amdgpu.ids")
+
+
+def marketing_name(device):
+    """libdrm's name for the device ID and revision, the one Mesa reports.
+
+    lspci and pci.ids name only the chip family ("RX 6800/6800 XT / 6900 XT").
+    """
+    try:
+        product = (device / "device").read_text().strip().removeprefix("0x").upper()
+        revision = (device / "revision").read_text().strip().removeprefix("0x").upper()
+        lines = AMDGPU_IDS.read_text().splitlines()
+    except (FileNotFoundError, OSError):
+        return None
+    for line in lines:
+        fields = [field.strip() for field in line.split(",", 2)]
+        if len(fields) == 3 and fields[0].upper() == product and fields[1].upper() == revision:
+            return short_gpu_name(fields[2])
+    return None
+
+
 def gpu_label(device):
+    name = marketing_name(device)
+    if name:
+        return name
     for path in (
         device / "drm",
         Path("/sys/class/drm"),
@@ -111,6 +135,17 @@ def apply_lspci_names(devices, output):
     return devices
 
 
+def bar_sizes(device):
+    """(BAR 0 size, largest size the card can resize it to) in bytes; None when unknown."""
+    try:
+        start, end = (int(field, 16) for field in (device / "resource").read_text().split()[:2])
+        sizes = int((device / "resource0_resize").read_text().strip(), 16)
+    except (OSError, ValueError):
+        return None, None
+    # Bit n of resource0_resize means a 2^(n + 20) byte BAR is supported.
+    return (end - start + 1 if end else None), (1 << (sizes.bit_length() + 19) if sizes else None)
+
+
 def gpu_status():
     devices = []
     # An unavailable sysfs is an error, not a disconnected GPU.
@@ -127,12 +162,20 @@ def gpu_status():
                 # gives it a new sysfs node.
                 "node": device.stat().st_ino,
                 "driver": driver.resolve().name if driver.exists() else None,
+                # amdgpu binds seconds before it registers the DRM card. Gamescope
+                # started in between enumerates only the built-in GPU.
+                "drm": any((device / "drm").glob("card*")),
                 "name": gpu_label(device),
             })
+            devices[-1]["bar"], devices[-1]["bar_max"] = bar_sizes(device)
         except FileNotFoundError:
             # Hot-unplug can remove a device between reads.
             continue
     return devices
+
+
+def gpu_ready(device):
+    return device.get("driver") == "amdgpu" and device.get("drm", False)
 
 
 def drives_display(address):
@@ -669,24 +712,73 @@ def remove_managed(files):
 SLEEP_HOOK_DIR = Path(__file__).resolve().parent / "sleephook"
 SLEEP_SERVICE = "egpu-sleep.service"
 SLEEP_RULE = "90-egpu-helper.rules"
+SLEEP_MODPROBE = "egpu-thunderbolt.conf"
+SLEEP_SUDOERS = "egpu-helper.sudoers"
+SLEEP_SCRIPT = Path("/etc/egpu-sleep/egpu-sleep.sh")
+REBAR_TIMEOUT_SEC = 90
 # Lives next to the installed sleep hook script while Keep dock linked is on.
 KEEP_DOCK_NAME = "keep-dock"
+
+
+def decky_user():
+    """The user the plugin runs as; under sudo, the user who ran sudo."""
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        return os.environ["SUDO_USER"]
+    return pwd.getpwuid(os.geteuid()).pw_name
 
 
 def sleep_hook_files(root=Path("/")):
     script = (SLEEP_HOOK_DIR / "egpu-sleep.sh").read_text().replace(
         "@EGPU_ID@", f"^0x{AMD_VENDOR}:0x({'|'.join(EGPU_DEVICES)})$",
     )
+    sudoers = (SLEEP_HOOK_DIR / SLEEP_SUDOERS).read_text().replace(
+        "@USER@", decky_user()).replace("@SCRIPT@", str(SLEEP_SCRIPT))
     return [
-        (root / "etc/egpu-sleep/egpu-sleep.sh", script, 0o755),
+        (root / SLEEP_SCRIPT.relative_to("/"), script, 0o755),
         (root / "etc/systemd/system" / SLEEP_SERVICE, (SLEEP_HOOK_DIR / SLEEP_SERVICE).read_text(), 0o644),
         (root / "etc/udev/rules.d" / SLEEP_RULE, (SLEEP_HOOK_DIR / SLEEP_RULE).read_text(), 0o644),
+        (root / "etc/modprobe.d" / SLEEP_MODPROBE, (SLEEP_HOOK_DIR / SLEEP_MODPROBE).read_text(), 0o644),
+        # sudo accepts a sudoers file that is not writable by others; 0644 keeps it readable
+        # for the plugin's status check. The last matching rule wins and sudoers.d is read
+        # in name order, so the name must sort after SteamOS's "wheel", whose rule asks
+        # for a password.
+        (root / "etc/sudoers.d/zz-egpu-helper", sudoers, 0o644),
     ]
+
+
+async def resize_egpu_bar():
+    """Ask the sleep hook to give a hot-plugged eGPU its full BAR.
+
+    True when the card is being re-added, so the caller must not restart Gamescope now:
+    the re-add is a new arrival. False when nothing was done and the caller goes on.
+    """
+    try:
+        path, content, _ = sleep_hook_files()[-1]
+        if not path.is_file() or path.read_text() != content:
+            return False
+        process = await asyncio.create_subprocess_exec(
+            str(SUDO), "-n", str(SLEEP_SCRIPT), "rebar",
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, cwd="/",
+        )
+    except OSError:
+        return False
+    try:
+        await asyncio.wait_for(process.communicate(), timeout=REBAR_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        # The root script may still be moving the card; a restart now could land on it.
+        process.kill()
+        return True
+    return process.returncode == 0
 
 
 def sleep_hook_state():
     files = sleep_hook_files()
-    return managed_state(files), files[0][0].with_name(KEEP_DOCK_NAME).exists()
+    state = managed_state(files)
+    # A file added by a plugin update is missing until the user turns the hook on again.
+    if state == "missing" and any(path.is_file() for path, _, _ in files):
+        state = "outdated"
+    return state, files[0][0].with_name(KEEP_DOCK_NAME).exists()
 
 
 async def system_unit_enabled(unit):
@@ -784,7 +876,7 @@ class Plugin:
         try:
             gpus = await self.named_gpus()
             result["gpu_on_pci"] = bool(gpus)
-            result["gpu_ready"] = any(device.get("driver") == "amdgpu" for device in gpus)
+            result["gpu_ready"] = any(gpu_ready(device) for device in gpus)
         except FileNotFoundError:
             # Missing sysfs is not "GPU unplugged". Leave PCI unknown.
             result["gpu_on_pci"] = None
@@ -989,7 +1081,7 @@ class Plugin:
     async def _auto_switch_tick(self):
         # Track sysfs nodes, not presence: across sleep the eGPU can be gone for
         # less than one poll.
-        ready = {device["node"] for device in await asyncio.to_thread(gpu_status) if device["driver"] == "amdgpu"}
+        ready = {device["node"] for device in await asyncio.to_thread(gpu_status) if gpu_ready(device)}
         if not ready:
             self._switch_due = None
         elif self._egpu_ready is not None and not ready <= self._egpu_ready:
@@ -1006,6 +1098,11 @@ class Plugin:
         autofix = await unit_status(SERVICE)
         if autofix.get("ActiveState") in ("activating", "deactivating") or autofix_restarted_recently():
             return  # The boot-time auto-fix is handling this arrival.
+        if await resize_egpu_bar():
+            return  # The card is coming back with a full BAR; that arrival is handled next.
+        # rebar may have restarted the session on the eGPU already.
+        if any(gpu_ready(device) and drives_display(device["address"]) for device in await asyncio.to_thread(gpu_status)):
+            return
         try:
             await self.restart_gamescope()
         except RuntimeError:

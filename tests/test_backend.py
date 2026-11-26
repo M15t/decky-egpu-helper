@@ -26,11 +26,20 @@ class DetectionTests(unittest.TestCase):
                 driver = root / "amdgpu"
                 driver.mkdir()
                 (device / "driver").symlink_to(driver)
+                status = main.gpu_status()[0]
+                self.assertFalse(status["drm"])
+                self.assertFalse(main.gpu_ready(status))
                 card = device / "drm" / "card1"
                 card.mkdir(parents=True)
                 (card / "device").mkdir()
                 (card / "device" / "label").write_text("AMD Radeon RX 6950 XT\n")
                 self.assertEqual(main.gpu_status()[0]["driver"], "amdgpu")
+                self.assertTrue(main.gpu_ready(main.gpu_status()[0]))
+                self.assertEqual(main.gpu_status()[0]["bar"], None)
+                (device / "resource").write_text("0x0000006000000000 0x000000600fffffff 0x14220c\n")
+                (device / "resource0_resize").write_text("0000000000007f00\n")
+                status = main.gpu_status()[0]
+                self.assertEqual((status["bar"], status["bar_max"]), (256 << 20, 16 << 30))
                 self.assertEqual(main.gpu_status()[0]["name"], "RX 6950 XT")
                 (device / "device").write_text("0x9999")
                 self.assertEqual(main.gpu_status(), [])
@@ -47,7 +56,7 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(names["0000:05:00.0"], "RX 6800 XT")
         self.assertEqual(names["05:00.0"], names["0000:05:00.0"])
         self.assertNotIn("0000:63:00.0", names)
-        devices = [{"address": "0000:05:00.0", "name": None, "driver": "amdgpu"}]
+        devices = [{"address": "0000:05:00.0", "name": None, "driver": "amdgpu", "drm": True}]
         main.apply_lspci_names(devices, output)
         self.assertEqual(devices[0]["name"], "RX 6800 XT")
         untitled = [{"address": "0000:05:00.0", "name": None}]
@@ -79,7 +88,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = main.Plugin()
         self.gpu = patch.object(main, "gpu_status", return_value=[
-            {"address": "0000:03:00.0", "driver": "amdgpu", "name": "RX 6950 XT"},
+            {"address": "0000:03:00.0", "driver": "amdgpu", "drm": True, "name": "RX 6950 XT"},
         ])
         self.gpu_mock = self.gpu.start()
         self.unit = patch.object(main, "unit_status", new=AsyncMock(
@@ -93,7 +102,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(patch.stopall)
 
     async def test_fills_gpu_name_from_lspci(self):
-        self.gpu_mock.return_value = [{"address": "0000:05:00.0", "driver": "amdgpu", "name": None}]
+        self.gpu_mock.return_value = [{"address": "0000:05:00.0", "driver": "amdgpu", "drm": True, "name": None}]
         self.plugin._lspci_names = {}
         self.plugin._lspci_at = 0
         with patch.object(main, "pci_scan", new=AsyncMock(return_value={
@@ -358,7 +367,7 @@ class BoltCommandTests(unittest.IsolatedAsyncioTestCase):
             "devices": [{"id": "one", "name": "Dock", "status": "authorized", "link": "40 Gb/s", "power": None}],
             "error": None,
         })), patch.object(main, "pci_scan", new=AsyncMock(return_value={"ran": True, "error": None})) as scan, \
-                patch.object(main, "gpu_status", return_value=[{"address": "gpu", "driver": "amdgpu", "name": "GPU"}]):
+                patch.object(main, "gpu_status", return_value=[{"address": "gpu", "driver": "amdgpu", "drm": True, "name": "GPU"}]):
             result = await main.Plugin().get_bolt_status()
             scan.assert_awaited_once()
             self.assertEqual(result["pci_scan"], {"ran": True, "error": None})
@@ -442,6 +451,29 @@ class ShortNameTests(unittest.TestCase):
         self.assertEqual(main.short_gpu_name("Navi 21 [Radeon RX 6800 XT]"), "RX 6800 XT")
 
 
+class MarketingNameTests(unittest.TestCase):
+    def test_revision_picks_the_model_within_a_chip_family(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name)
+        ids = root / "amdgpu.ids"
+        ids.write_text(
+            "# List of AMDGPU IDs\n"
+            "73BF,\tC1,\tAMD Radeon RX 6800 XT\n"
+            "73BF,\tC3,\tAMD Radeon RX 6800\n"
+        )
+        device = root / "0000:05:00.0"
+        device.mkdir()
+        (device / "device").write_text("0x73bf\n")
+        (device / "revision").write_text("0xc3\n")
+        with patch.object(main, "AMDGPU_IDS", ids):
+            self.assertEqual(main.gpu_label(device), "RX 6800")
+            (device / "revision").write_text("0xc1\n")
+            self.assertEqual(main.gpu_label(device), "RX 6800 XT")
+            (device / "revision").write_text("0xff\n")
+            self.assertIsNone(main.marketing_name(device))
+
+
 class BacklightTests(unittest.TestCase):
     def test_skips_egpu_backlight(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -510,7 +542,7 @@ class AutofixTests(unittest.TestCase):
 
     def test_script_matches_every_supported_gpu(self):
         script = self.files[0][1]
-        self.assertIn('EGPU_ID="1002:(73ff|7550)"', script)
+        self.assertIn('EGPU_ID="1002:(73ff|73bf|7550)"', script)
         self.assertNotIn("@EGPU_ID@", script)
         self.assertEqual(main.managed_state(self.files), "missing")
         main.write_managed(self.files)
@@ -603,7 +635,7 @@ class SleepHookTests(unittest.IsolatedAsyncioTestCase):
 
     def test_script_matches_supported_gpus_only(self):
         script = self.files[0][1]
-        self.assertIn("EGPU_ID='^0x1002:0x(73ff|7550)$'", script)
+        self.assertIn("EGPU_ID='^0x1002:0x(73ff|73bf|7550)$'", script)
         self.files[0][0].parent.mkdir(parents=True)
         main.write_managed(self.files)
         path = str(self.files[0][0])
@@ -632,7 +664,8 @@ class SleepHookTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(main.managed_state(self.files), "current")
             self.assertTrue(hand.with_name(hand.name + ".bak").exists())
             installer.remove()
-        self.assertEqual(calls, [["daemon-reload"], ["enable", main.SLEEP_SERVICE], ["pm", "on"],
+        self.assertEqual(calls[0][0], "-cqf")
+        self.assertEqual(calls[1:], [["daemon-reload"], ["enable", main.SLEEP_SERVICE], ["pm", "on"],
                                  ["disable", main.SLEEP_SERVICE], ["pm", "auto"], ["daemon-reload"]])
         self.assertFalse(any(path.exists() for path, _, _ in self.files))
 
@@ -655,6 +688,68 @@ class SleepHookTests(unittest.IsolatedAsyncioTestCase):
 
     def test_hook_reads_marker_next_to_itself(self):
         self.assertIn(f'KEEP_DOCK="${{0%/*}}/{main.KEEP_DOCK_NAME}"', self.files[0][1])
+
+    def test_modprobe_keeps_firmware_tunnel(self):
+        path, content, _ = next(file for file in self.files if file[0].parent.name == "modprobe.d")
+        self.assertEqual(path, self.root / "etc/modprobe.d/egpu-thunderbolt.conf")
+        self.assertIn(main.MANAGED, content)
+        self.assertIn("options thunderbolt host_reset=0\n", content)
+
+    def test_file_added_by_update_reports_outdated(self):
+        main.write_managed(self.files[:-1])
+        with patch.object(main, "sleep_hook_files", return_value=self.files):
+            self.assertEqual(main.sleep_hook_state()[0], "outdated")
+            self.files[-1][0].parent.mkdir(parents=True, exist_ok=True)
+            main.write_managed(self.files[-1:])
+            self.assertEqual(main.sleep_hook_state()[0], "current")
+
+    def test_sudoers_allows_only_rebar(self):
+        path, content, mode = self.files[-1]
+        self.assertEqual(path, self.root / "etc/sudoers.d/zz-egpu-helper")
+        self.assertNotIn(".", path.name)
+        # sudo reads sudoers.d in name order and the last match wins.
+        self.assertGreater(path.name, "wheel-prepare-oobe-test")
+        self.assertFalse(mode & 0o022)
+        rule = [line for line in content.splitlines() if line and not line.startswith("#")]
+        self.assertEqual(rule, [f"{main.decky_user()} ALL=(root) NOPASSWD: /etc/egpu-sleep/egpu-sleep.sh rebar"])
+        self.assertIn(main.MANAGED, content)
+
+    def test_bad_sudoers_is_never_written(self):
+        installer = self.load_installer()
+
+        def run(args, **_):
+            if args[0] == "/usr/bin/visudo":
+                raise subprocess.CalledProcessError(1, args)
+
+        with patch.object(installer, "sleep_hook_files", return_value=self.files), \
+                patch.object(installer.subprocess, "run", side_effect=run):
+            with self.assertRaises(subprocess.CalledProcessError):
+                installer.install()
+        self.assertFalse(any(path.exists() for path, _, _ in self.files))
+
+    async def test_rebar_needs_the_installed_rule(self):
+        with patch.object(main, "sleep_hook_files", return_value=self.files), \
+                patch.object(main.asyncio, "create_subprocess_exec", new=AsyncMock()) as spawn:
+            self.assertFalse(await main.resize_egpu_bar())
+            spawn.assert_not_awaited()
+
+    async def test_rebar_failure_to_start_lets_the_restart_happen(self):
+        rule = self.files[-1]
+        rule[0].parent.mkdir(parents=True)
+        main.write_managed([rule])
+        with patch.object(main, "sleep_hook_files", return_value=self.files), \
+                patch.object(main.asyncio, "create_subprocess_exec", new=AsyncMock(side_effect=OSError)):
+            self.assertFalse(await main.resize_egpu_bar())
+
+    def test_bar_too_small_reads_resizable_sizes(self):
+        function = self.files[0][1].split("bar_too_small() {", 1)[1].split("\n}\n", 1)[0]
+        device = self.root / "gpu"
+        device.mkdir()
+        (device / "resource0_resize").write_text("0000000000007f00\n")
+        for size, small in ((256 << 20, True), (16 << 30, False)):
+            (device / "resource").write_text(f"0x6000000000 {hex(0x6000000000 + size - 1)} 0x14220c\n")
+            probe = f"bar_too_small() {{{function}\n}}\nbar_too_small {device}"
+            self.assertEqual(subprocess.run(["bash", "-c", probe]).returncode == 0, small, size)
 
     def test_udev_rule_runs_installed_script(self):
         script = "/" + str(self.files[0][0].relative_to(self.root))
@@ -723,6 +818,7 @@ class AutoSwitchTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "autofix_marker", return_value=self.marker),
             patch.object(main, "unit_status", new=AsyncMock(return_value={"ActiveState": "inactive"})),
             patch.object(self.plugin, "restart_gamescope", new=self.restart),
+            patch.object(main, "resize_egpu_bar", new=AsyncMock(return_value=False)),
         ]
         for patcher in patches:
             patcher.start()
@@ -733,7 +829,7 @@ class AutoSwitchTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._auto_switch_tick()
 
     def plug(self, node=1):
-        self.gpus = [{"address": "0000:05:00.0", "node": node, "driver": "amdgpu", "name": "RX 6600"}]
+        self.gpus = [{"address": "0000:05:00.0", "node": node, "driver": "amdgpu", "drm": True, "name": "RX 6600"}]
 
     async def test_arrival_restarts_once_after_settling(self):
         await self.tick()
@@ -743,6 +839,41 @@ class AutoSwitchTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(main.AUTO_SWITCH_SETTLE_SEC)
         await self.tick()
         self.restart.assert_awaited_once()
+
+    async def test_waits_for_the_drm_card(self):
+        # After wake amdgpu was bound at 22:02:16 but registered its card only at 22:02:24.
+        await self.tick()
+        self.plug()
+        self.gpus[0]["drm"] = False
+        for _ in range(4):
+            await self.tick(main.AUTO_SWITCH_SETTLE_SEC)
+        self.restart.assert_not_awaited()
+        self.gpus[0]["drm"] = True
+        await self.tick()
+        self.restart.assert_not_awaited()
+        await self.tick(main.AUTO_SWITCH_SETTLE_SEC)
+        self.restart.assert_awaited_once()
+
+    async def test_bar_resize_readds_the_card_then_restarts_once(self):
+        main.resize_egpu_bar.side_effect = [True, False]
+        await self.tick()
+        self.plug(node=1)
+        await self.tick()
+        await self.tick(main.AUTO_SWITCH_SETTLE_SEC)
+        self.restart.assert_not_awaited()
+        self.plug(node=2)
+        await self.tick()
+        await self.tick(main.AUTO_SWITCH_SETTLE_SEC)
+        self.restart.assert_awaited_once()
+        self.assertEqual(main.resize_egpu_bar.await_count, 2)
+
+    async def test_no_restart_when_the_session_already_shows_on_the_egpu(self):
+        await self.tick()
+        self.plug()
+        with patch.object(main, "drives_display", return_value=True):
+            await self.tick()
+            await self.tick(main.AUTO_SWITCH_SETTLE_SEC)
+        self.restart.assert_not_awaited()
 
     async def test_readd_between_polls_is_an_arrival(self):
         # Across sleep the hook removes the eGPU and it returns before the next poll.

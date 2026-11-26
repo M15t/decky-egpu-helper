@@ -42,7 +42,8 @@ def is_egpu(device):
 def ready_egpu():
     """PCI device of an eGPU with amdgpu bound, or None."""
     for device in sorted(PCI_DEVICES.glob("*")):
-        if is_egpu(device) and (device / "driver").is_symlink() and os.readlink(device / "driver").endswith("/amdgpu"):
+        if (is_egpu(device) and (device / "driver").is_symlink() and os.readlink(device / "driver").endswith("/amdgpu")
+                and any((device / "drm").glob("card*"))):
             return device
     return None
 

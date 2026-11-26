@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { BsGpuCard } from "react-icons/bs";
 
 type Status = {
-  devices: { address: string; driver: string | null; name: string | null }[];
+  devices: { address: string; driver: string | null; name: string | null; bar?: number | null; bar_max?: number | null }[];
   egpu_display: boolean;
   service: Record<string, string>;
   target: Record<string, string>;
@@ -60,6 +60,7 @@ const setShaderSwap = callable<[boolean], ShaderStatus>("set_shader_swap");
 const getShaderInfo = callable<[], ShaderInfo>("get_shader_info");
 const deleteInactiveShaders = callable<[string], { freed: number }>("delete_inactive_shaders");
 const getVersion = callable<[], string>("get_version");
+const formatBar = (bytes: number) => bytes >= 2 ** 30 ? `${bytes / 2 ** 30} GB` : `${bytes / 2 ** 20} MB`;
 const formatBytes = (bytes: number) =>
   bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${Math.round(bytes / 1e6)} MB` : `${Math.round(bytes / 1e3)} KB`;
 const errorText =(error: unknown) => error instanceof Error ? error.message : String(error);
@@ -153,6 +154,7 @@ function StatusSection({ tick }: { tick: number }) {
     : bolt?.pci_scan?.error ?? (error && status ? error : null);
 
   const gpu = gpuRow(status, error);
+  const bar = status?.devices.find(device => device.driver === "amdgpu");
   const dock = dockRow(bolt);
   return (
     <PanelSection title="Status">
@@ -165,6 +167,13 @@ function StatusSection({ tick }: { tick: number }) {
       {ready && (
         <PanelSectionRow>
           <Field label="Display">{status?.egpu_display ? "eGPU" : "Built-in GPU"}</Field>
+        </PanelSectionRow>
+      )}
+      {bar?.bar && bar.bar_max && (
+        <PanelSectionRow>
+          <Field label="Resizable BAR" description={bar.bar < bar.bar_max ? `${formatBar(bar.bar)} of ${formatBar(bar.bar_max)}` : formatBar(bar.bar)}>
+            {bar.bar < bar.bar_max ? "Off" : "On"}
+          </Field>
         </PanelSectionRow>
       )}
       {(hint || (!status && error)) && (

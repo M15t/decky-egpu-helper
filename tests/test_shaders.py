@@ -89,9 +89,13 @@ class ShaderSwapTests(unittest.TestCase):
         driver = device / "driver"
         if driver.is_symlink():
             driver.unlink()
+        card = device / "drm/card1"
         if ready:
             (self.pci / "amdgpu").mkdir(exist_ok=True)
             driver.symlink_to(self.pci / "amdgpu")
+            card.mkdir(parents=True, exist_ok=True)
+        elif card.exists():
+            card.rmdir()
 
     def cache_link(self):
         return os.readlink(self.steamapps / "shadercache")
@@ -173,7 +177,7 @@ class ShaderTogglePluginTests(unittest.IsolatedAsyncioTestCase):
         steam = self.plugin._home / ".config/systemd/user/steam-launcher.service.d" / main.STEAM_DROPIN
         self.assertIn("EnvironmentFile=-%t/egpu-helper-environment", steam.read_text())
         script = (self.plugin._home / ".local/bin/egpu-shader-swap.py").read_text()
-        self.assertIn('"73ff,7550"', script)
+        self.assertIn('"73ff,73bf,7550"', script)
         status = await self.plugin.set_shader_swap(False)
         self.assertEqual(status, {"state": "missing"})
         calls = [call.args for call in self.command_mock.await_args_list]
